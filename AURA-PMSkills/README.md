@@ -113,7 +113,7 @@ pm-engine validate -v                                                           
 python -m pytest tests -q                                                              # 125 passed
 ```
 
-CI runs the same three layers on Python 3.10–3.13 (`.github/workflows/pm-engine-tests.yml`).
+A ready-made GitHub Actions workflow running the same three layers on Python 3.10–3.13 is in [`ci/pm-engine-tests.yml`](ci/README.md) — move it to `.github/workflows/` to enable it.
 
 ## Design notes
 
