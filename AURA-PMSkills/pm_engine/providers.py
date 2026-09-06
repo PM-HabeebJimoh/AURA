@@ -7,15 +7,20 @@ and OpenAI-compatible backends are called over plain HTTPS with
 
 Selection (``pm_engine.providers.auto_provider``):
 
-1. explicit ``PM_ENGINE_PROVIDER`` = ``anthropic`` | ``openai`` | ``ollama`` | ``offline``
-2. ``ANTHROPIC_API_KEY`` present  → Anthropic
-3. ``OPENAI_API_KEY`` present     → OpenAI-compatible (``OPENAI_BASE_URL`` honoured)
-4. ``OLLAMA_HOST`` present        → Ollama
-5. otherwise                       → :class:`OfflineProvider` (deterministic, no network)
+1. explicit ``PM_ENGINE_PROVIDER`` = ``arena`` | ``anthropic`` | ``openai`` | ``ollama`` | ``offline``
+2. ``ARENA_API_KEY`` present      → Arena.ai (``ARENA_BASE_URL``, ``ARENA_MODEL``, ``ARENA_API_FORMAT``)
+3. ``ANTHROPIC_API_KEY`` present  → Anthropic
+4. ``OPENAI_API_KEY`` present     → OpenAI-compatible (``OPENAI_BASE_URL`` honoured)
+5. ``OLLAMA_HOST`` present        → Ollama
+6. otherwise                       → :class:`OfflineProvider` (deterministic, no network)
+
+Keys may live in the environment or in ``.env`` / ``~/.aura/pm-engine.env``
+(see :mod:`pm_engine.config`) — loaded once, never overriding real env vars.
 """
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import re
@@ -25,12 +30,28 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Callable, Iterator, Protocol
 
-RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504, 529}
-MAX_RETRIES = int(os.environ.get("PM_ENGINE_MAX_RETRIES", "3"))
+from .config import load_env_files
 
-DEFAULT_ANTHROPIC_MODEL = os.environ.get("PM_ENGINE_ANTHROPIC_MODEL", "claude-sonnet-4-5")
-DEFAULT_OPENAI_MODEL = os.environ.get("PM_ENGINE_OPENAI_MODEL", "gpt-4o-mini")
-DEFAULT_OLLAMA_MODEL = os.environ.get("PM_ENGINE_OLLAMA_MODEL", "llama3.1")
+RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504, 529}
+# statuses that mean "this endpoint does not speak the wire format we just used" (drives Arena auto-detection)
+FORMAT_MISMATCH_STATUS = {400, 404, 405, 415, 422}
+MAX_RETRIES = int(os.environ.get("PM_ENGINE_MAX_RETRIES", "3"))
+_retry_override: contextvars.ContextVar[int | None] = contextvars.ContextVar("pm_engine_retries", default=None)
+
+DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-5"
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+DEFAULT_OLLAMA_MODEL = "llama3.1"
+DEFAULT_ARENA_MODEL = "claude-sonnet-4-5"
+DEFAULT_ARENA_BASE_URL = "https://api.arena.ai/v1"
+
+
+def _env(*names: str, default: str | None = None) -> str | None:
+    """First non-empty environment variable among *names* (read at call time so ``.env`` files count)."""
+    for n in names:
+        v = os.environ.get(n)
+        if v:
+            return v
+    return default
 
 
 class ProviderError(RuntimeError):
@@ -81,9 +102,10 @@ class _StreamMixin:
         yield from iter_chunks(text)
 
 
-def _request(url: str, payload: dict, headers: dict, timeout: float):
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=body, method="POST", headers={"Content-Type": "application/json", **headers})
+def _request(url: str, payload: dict | None, headers: dict, timeout: float, method: str = "POST"):
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    hdrs = {"Content-Type": "application/json", **headers} if body is not None else dict(headers)
+    req = urllib.request.Request(url, data=body, method=method, headers=hdrs)
     try:
         return urllib.request.urlopen(req, timeout=timeout)  # noqa: S310 — https to configured API host
     except urllib.error.HTTPError as e:  # pragma: no cover - network
@@ -93,8 +115,12 @@ def _request(url: str, payload: dict, headers: dict, timeout: float):
         raise ProviderError(f"network error calling {url}: {e.reason}") from e
 
 
-def _with_retries(fn: Callable[[], object], *, retries: int = MAX_RETRIES, base_delay: float = 1.0):
+def _with_retries(fn: Callable[[], object], *, retries: int | None = None, base_delay: float = 1.0):
     """Call *fn*, retrying transient provider errors with exponential backoff."""
+    if retries is None:
+        retries = _retry_override.get()
+    if retries is None:
+        retries = MAX_RETRIES
     attempt = 0
     while True:
         try:
@@ -112,6 +138,26 @@ def _post_json(url: str, payload: dict, headers: dict, timeout: float = 180.0) -
             return json.loads(resp.read().decode("utf-8"))
 
     return _with_retries(go)  # type: ignore[return-value]
+
+
+def _get_json(url: str, headers: dict, timeout: float = 60.0) -> dict:
+    def go() -> dict:
+        with _request(url, None, headers, timeout, method="GET") as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    return _with_retries(go)  # type: ignore[return-value]
+
+
+class no_retries:
+    """Context manager: make provider calls fail fast (used by connectivity checks)."""
+
+    def __enter__(self):
+        self._token = _retry_override.set(0)
+        return self
+
+    def __exit__(self, *exc):
+        _retry_override.reset(self._token)
+        return False
 
 
 def _post_sse(url: str, payload: dict, headers: dict, timeout: float = 300.0) -> Iterator[dict]:
@@ -138,28 +184,28 @@ def _post_sse(url: str, payload: dict, headers: dict, timeout: float = 300.0) ->
 class AnthropicProvider:
     name = "anthropic"
 
-    def __init__(self, api_key: str | None = None, model: str = DEFAULT_ANTHROPIC_MODEL, base_url: str | None = None):
+    def __init__(self, api_key: str | None = None, model: str | None = None, base_url: str | None = None, extra_headers: dict | None = None):
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
         if not self.api_key:
             raise ProviderError("ANTHROPIC_API_KEY is not set")
-        self.model = model
+        self.model = model or _env("PM_ENGINE_ANTHROPIC_MODEL", "ANTHROPIC_MODEL", default=DEFAULT_ANTHROPIC_MODEL)
         self.base_url = (base_url or os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com").rstrip("/")
+        self.extra_headers = dict(extra_headers or {})
+
+    def _headers(self) -> dict:
+        return {"x-api-key": self.api_key, "anthropic-version": "2023-06-01", **self.extra_headers}
 
     def complete(self, system: str, messages: list[dict], *, max_tokens: int = 4096, temperature: float = 0.4) -> Completion:
         t0 = time.time()
         payload = {"model": self.model, "max_tokens": max_tokens, "temperature": temperature, "system": system, "messages": messages}
-        data = _post_json(
-            f"{self.base_url}/v1/messages",
-            payload,
-            {"x-api-key": self.api_key, "anthropic-version": "2023-06-01"},
-        )
+        data = _post_json(f"{self.base_url}/v1/messages", payload, self._headers())
         text = "".join(block.get("text", "") for block in data.get("content", []) if block.get("type") == "text")
         usage = data.get("usage", {})
         return Completion(text=text, provider=self.name, model=data.get("model", self.model), input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"), latency_s=time.time() - t0, raw=data)
 
     def stream(self, system: str, messages: list[dict], *, max_tokens: int = 4096, temperature: float = 0.4) -> Iterator[str]:
         payload = {"model": self.model, "max_tokens": max_tokens, "temperature": temperature, "system": system, "messages": messages, "stream": True}
-        for ev in _post_sse(f"{self.base_url}/v1/messages", payload, {"x-api-key": self.api_key, "anthropic-version": "2023-06-01", "Accept": "text/event-stream"}):
+        for ev in _post_sse(f"{self.base_url}/v1/messages", payload, {**self._headers(), "Accept": "text/event-stream"}):
             if ev.get("type") == "content_block_delta":
                 delta = ev.get("delta") or {}
                 if delta.get("type") == "text_delta" and delta.get("text"):
@@ -174,18 +220,26 @@ class AnthropicProvider:
 class OpenAIProvider:
     name = "openai"
 
-    def __init__(self, api_key: str | None = None, model: str = DEFAULT_OPENAI_MODEL, base_url: str | None = None):
+    def __init__(self, api_key: str | None = None, model: str | None = None, base_url: str | None = None, extra_headers: dict | None = None):
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
         self.base_url = (base_url or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
         if not self.api_key and "api.openai.com" in self.base_url:
             raise ProviderError("OPENAI_API_KEY is not set")
-        self.model = model
+        self.model = model or _env("PM_ENGINE_OPENAI_MODEL", "OPENAI_MODEL", default=DEFAULT_OPENAI_MODEL)
+        self.extra_headers = dict(extra_headers or {})
+
+    def _headers(self) -> dict:
+        return {**({"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}), **self.extra_headers}
+
+    def list_models(self) -> list[str]:
+        data = _get_json(f"{self.base_url}/models", self._headers())
+        items = data.get("data") if isinstance(data, dict) else data
+        return sorted(str(m.get("id") or m.get("name")) for m in (items or []) if isinstance(m, dict) and (m.get("id") or m.get("name")))
 
     def complete(self, system: str, messages: list[dict], *, max_tokens: int = 4096, temperature: float = 0.4) -> Completion:
         t0 = time.time()
         payload = {"model": self.model, "max_tokens": max_tokens, "temperature": temperature, "messages": [{"role": "system", "content": system}, *messages]}
-        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
-        data = _post_json(f"{self.base_url}/chat/completions", payload, headers)
+        data = _post_json(f"{self.base_url}/chat/completions", payload, self._headers())
         choice = (data.get("choices") or [{}])[0]
         text = (choice.get("message") or {}).get("content") or ""
         usage = data.get("usage", {})
@@ -193,8 +247,7 @@ class OpenAIProvider:
 
     def stream(self, system: str, messages: list[dict], *, max_tokens: int = 4096, temperature: float = 0.4) -> Iterator[str]:
         payload = {"model": self.model, "max_tokens": max_tokens, "temperature": temperature, "stream": True, "messages": [{"role": "system", "content": system}, *messages]}
-        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
-        for ev in _post_sse(f"{self.base_url}/chat/completions", payload, headers):
+        for ev in _post_sse(f"{self.base_url}/chat/completions", payload, self._headers()):
             for choice in ev.get("choices") or []:
                 piece = (choice.get("delta") or {}).get("content")
                 if piece:
@@ -207,11 +260,15 @@ class OpenAIProvider:
 class OllamaProvider:
     name = "ollama"
 
-    def __init__(self, host: str | None = None, model: str = DEFAULT_OLLAMA_MODEL):
+    def __init__(self, host: str | None = None, model: str | None = None):
         self.host = (host or os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434").rstrip("/")
         if not self.host.startswith("http"):
             self.host = "http://" + self.host
-        self.model = model
+        self.model = model or _env("PM_ENGINE_OLLAMA_MODEL", "OLLAMA_MODEL", default=DEFAULT_OLLAMA_MODEL)
+
+    def list_models(self) -> list[str]:
+        data = _get_json(f"{self.host}/api/tags", {})
+        return sorted(str(m.get("name")) for m in data.get("models", []) if m.get("name"))
 
     def complete(self, system: str, messages: list[dict], *, max_tokens: int = 4096, temperature: float = 0.4) -> Completion:
         t0 = time.time()
@@ -228,6 +285,144 @@ class OllamaProvider:
                 yield piece
             if ev.get("done"):
                 return
+
+
+
+# ─── Arena.ai ────────────────────────────────────────────────────────────────
+
+
+class ArenaProvider:
+    """Arena.ai (arena.ai) model gateway.
+
+    Configuration (environment or ``.env``):
+
+    * ``ARENA_API_KEY``     — required
+    * ``ARENA_BASE_URL``    — API root (default ``https://api.arena.ai/v1``)
+    * ``ARENA_MODEL``       — model id (default ``claude-sonnet-4-5``)
+    * ``ARENA_API_FORMAT``  — ``openai`` | ``anthropic`` | ``auto`` (default ``auto``)
+    * ``ARENA_AUTH_HEADER`` — ``bearer`` (``Authorization: Bearer``), ``x-api-key``, or any header name
+
+    Arena fronts many vendors' models, so the wire format is configurable:
+    ``openai`` talks ``POST {base}/chat/completions`` (+ ``GET {base}/models``);
+    ``anthropic`` talks ``POST {base}/messages`` with ``anthropic-version``.
+    In ``auto`` mode the first request is sent in OpenAI format and, if the
+    endpoint rejects the *shape* of the request (400/404/405/415/422), it is
+    retried once in Anthropic format; the working format is then remembered.
+    Auth failures (401/403), rate limits and server errors are **not** used
+    for detection — they propagate as :class:`ProviderError` like any provider.
+    """
+
+    name = "arena"
+
+    def __init__(self, api_key: str | None = None, model: str | None = None, base_url: str | None = None, api_format: str | None = None, auth_header: str | None = None):
+        self.api_key = api_key or os.environ.get("ARENA_API_KEY")
+        if not self.api_key:
+            raise ProviderError("ARENA_API_KEY is not set (put it in the environment, ./.env, or ~/.aura/pm-engine.env)")
+        self.base_url = (base_url or _env("ARENA_BASE_URL", "ARENA_API_URL", default=DEFAULT_ARENA_BASE_URL) or DEFAULT_ARENA_BASE_URL).rstrip("/")
+        self.model = model or _env("ARENA_MODEL", "PM_ENGINE_ARENA_MODEL", default=DEFAULT_ARENA_MODEL) or DEFAULT_ARENA_MODEL
+        fmt = (api_format or _env("ARENA_API_FORMAT", default="auto") or "auto").lower()
+        if fmt not in ("auto", "openai", "anthropic"):
+            raise ProviderError(f"ARENA_API_FORMAT must be auto|openai|anthropic, got '{fmt}'")
+        self.api_format = fmt
+        self.auth_header = (auth_header or _env("ARENA_AUTH_HEADER", default="bearer") or "bearer").lower()
+        self._resolved: str | None = None if fmt == "auto" else fmt
+
+    # -- wiring ----------------------------------------------------------
+
+    def _headers(self) -> dict:
+        if self.auth_header == "bearer":
+            return {"Authorization": f"Bearer {self.api_key}"}
+        return {self.auth_header: self.api_key}
+
+    def _backend(self, fmt: str):
+        if fmt == "anthropic":
+            base = self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
+            headers = self._headers() if self.auth_header != "bearer" else {}
+            if self.auth_header == "bearer":
+                # Anthropic-format endpoints usually expect x-api-key; send both forms so either gateway convention works
+                headers = {"x-api-key": self.api_key, "Authorization": f"Bearer {self.api_key}"}
+            b = AnthropicProvider(api_key=self.api_key, model=self.model, base_url=base, extra_headers=headers)
+        else:
+            b = OpenAIProvider(api_key=self.api_key, model=self.model, base_url=self.base_url, extra_headers=self._headers() if self.auth_header != "bearer" else {})
+        return b
+
+    @property
+    def formats(self) -> list[str]:
+        if self._resolved:
+            return [self._resolved]
+        return ["openai", "anthropic"]
+
+    def _call(self, op: str, *args, **kwargs):
+        last: ProviderError | None = None
+        for fmt in self.formats:
+            try:
+                out = getattr(self._backend(fmt), op)(*args, **kwargs)
+                self._resolved = fmt
+                return out
+            except ProviderError as e:
+                last = e
+                if self._resolved or e.status not in FORMAT_MISMATCH_STATUS:
+                    raise
+        assert last is not None
+        raise ProviderError(f"Arena endpoint {self.base_url} accepted neither OpenAI nor Anthropic request format: {last}", status=last.status)
+
+    # -- Provider API ----------------------------------------------------
+
+    def complete(self, system: str, messages: list[dict], *, max_tokens: int = 4096, temperature: float = 0.4) -> Completion:
+        c: Completion = self._call("complete", system, messages, max_tokens=max_tokens, temperature=temperature)
+        c.provider = self.name
+        return c
+
+    def stream(self, system: str, messages: list[dict], *, max_tokens: int = 4096, temperature: float = 0.4) -> Iterator[str]:
+        # streaming generators fail lazily, so detect the format with a cheap non-streaming probe only when unknown
+        if not self._resolved:
+            self.list_models() if self.api_format == "auto" else None
+        if not self._resolved:  # /models unavailable → decide with the real request
+            for fmt in self.formats:
+                gen = self._backend(fmt).stream(system, messages, max_tokens=max_tokens, temperature=temperature)
+                try:
+                    first = next(gen)
+                except StopIteration:
+                    self._resolved = fmt
+                    return
+                except ProviderError as e:
+                    if e.status in FORMAT_MISMATCH_STATUS and fmt != self.formats[-1]:
+                        continue
+                    raise
+                self._resolved = fmt
+                yield first
+                yield from gen
+                return
+            return
+        yield from self._backend(self._resolved).stream(system, messages, max_tokens=max_tokens, temperature=temperature)
+
+    def list_models(self) -> list[str]:
+        """Model ids offered by the endpoint (OpenAI-style ``GET /models``); empty list if unsupported."""
+        try:
+            models = self._backend("openai").list_models()
+        except ProviderError as e:
+            if e.status in FORMAT_MISMATCH_STATUS | {501}:
+                return []
+            raise
+        if models and not self._resolved and self.api_format == "auto":
+            self._resolved = "openai"
+        return models
+
+    def check(self) -> dict:
+        """One cheap round-trip; returns a dict for ``pm-engine doctor`` / ``/api/providers``."""
+        t0 = time.time()
+        info: dict = {"provider": self.name, "base_url": self.base_url, "model": self.model, "format": self._resolved or self.api_format}
+        with no_retries():
+            try:
+                models = self.list_models()
+                info["models"] = len(models)
+                if models and self.model not in models:
+                    info["warning"] = f"model '{self.model}' not in the endpoint's model list"
+                c = self.complete("Reply with the single word OK.", [{"role": "user", "content": "ping"}], max_tokens=8, temperature=0)
+                info.update(ok=True, format=self._resolved, reply=c.text.strip()[:40], model=c.model, latency_s=round(time.time() - t0, 2))
+            except ProviderError as e:
+                info.update(ok=False, error=str(e)[:300], status=e.status, latency_s=round(time.time() - t0, 2))
+        return info
 
 
 # ─── Offline (deterministic; used by tests and when no key is configured) ────
@@ -347,6 +542,7 @@ def _skill_scaffold(system: str, request: str) -> str:
 # ─── Selection ───────────────────────────────────────────────────────────────
 
 _REGISTRY: dict[str, Callable[..., Provider]] = {
+    "arena": ArenaProvider,
     "anthropic": AnthropicProvider,
     "openai": OpenAIProvider,
     "ollama": OllamaProvider,
@@ -355,6 +551,7 @@ _REGISTRY: dict[str, Callable[..., Provider]] = {
 
 
 def make_provider(name: str, **kwargs) -> Provider:
+    load_env_files()
     name = name.lower()
     if name not in _REGISTRY:
         raise ProviderError(f"unknown provider '{name}'. Choose from: {', '.join(_REGISTRY)}")
@@ -362,10 +559,13 @@ def make_provider(name: str, **kwargs) -> Provider:
 
 
 def auto_provider(model: str | None = None) -> Provider:
+    load_env_files()
     forced = os.environ.get("PM_ENGINE_PROVIDER")
     kwargs = {"model": model} if model else {}
     if forced:
         return make_provider(forced, **kwargs)
+    if os.environ.get("ARENA_API_KEY"):
+        return ArenaProvider(**kwargs)
     if os.environ.get("ANTHROPIC_API_KEY"):
         return AnthropicProvider(**kwargs)
     if os.environ.get("OPENAI_API_KEY"):
@@ -376,7 +576,9 @@ def auto_provider(model: str | None = None) -> Provider:
 
 
 def available_providers() -> dict[str, bool]:
+    load_env_files()
     return {
+        "arena": bool(os.environ.get("ARENA_API_KEY")),
         "anthropic": bool(os.environ.get("ANTHROPIC_API_KEY")),
         "openai": bool(os.environ.get("OPENAI_API_KEY")),
         "ollama": bool(os.environ.get("OLLAMA_HOST")),

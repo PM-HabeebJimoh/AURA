@@ -12,7 +12,7 @@ AURA-PMSkills/
 ├── aura-skills/        ← AURA's own marketplace (same spec) — merged on top of pm-skills automatically
 │   └── aura-architecture/   (3 skills + `/design-brief` workflow: floor-plan brief → design score → cost check)
 ├── pm_engine/          ← the engine (pure Python, stdlib core)
-├── tests/              ← engine test-suite (146 tests)
+├── tests/              ← engine test-suite (163 tests; includes a mock LLM gateway for the Arena path)
 └── pyproject.toml      ← `pip install -e .` → `pm-engine` CLI
 ```
 
@@ -27,7 +27,7 @@ Upstream ships *content* that Claude Code interprets at runtime. The engine make
 | **Auto-load** the right skills from plain-English requests (BM25 + trigger phrases) | `search.py` | "skills are loaded automatically when relevant" |
 | Parse each command into an executable **workflow**: steps, modes, checkpoints, chained skills, output template, follow-up offers | `workflow.py` | `### Step N`, `[plan\|retro] <ctx>` modes, `**Checkpoint**`, "Offer Next Steps" |
 | Assemble system/user prompts, substitute `$ARGUMENTS`, delimit attachments as untrusted data | `prompt.py` | `$ARGUMENTS` placeholder, untrusted-input rule |
-| Execute with **Anthropic**, **OpenAI-compatible**, **Ollama**, or a deterministic **offline** provider — **streaming** on every backend, retries with back-off on 429/5xx/529 | `providers.py` | — |
+| Execute with **Arena.ai**, **Anthropic**, **OpenAI-compatible**, **Ollama**, or a deterministic **offline** provider — **streaming** on every backend, retries with back-off on 429/5xx/529; keys from env or `.env` files (`pm-engine setup`) | `providers.py`, `config.py` | — |
 | Persist multi-turn **sessions**; run a workflow one step at a time and pause at checkpoints | `session.py`, `runner.py` | checkpoint pauses |
 | **Export** skills to Claude / Cursor / Gemini CLI / OpenCode / Kiro / Codex (commands → skills) / JSON bundle / rendered prompts | `export.py` | README "Other AI assistants" section |
 | **Validate**: upstream plugin-spec checks + engine-level checks (unresolved skill refs, unparsable workflows, count drift) | `validator.py` | `validate_plugins.py` + `tests/` |
@@ -45,17 +45,37 @@ pip install -e ".[dev]"          # flask + pyyaml + pytest; the engine core itse
 pm-engine --version
 ```
 
-Choose a model backend (optional — without a key the engine runs fully offline with template scaffolds):
+### Connect a model backend
+
+Without a key the engine runs fully offline (deterministic template scaffolds). To get real model output, connect **Arena.ai** — or any of the other backends:
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-…          # → Anthropic (default model claude-sonnet-4-5)
-# or
-export OPENAI_API_KEY=sk-…                  # → OpenAI-compatible (OPENAI_BASE_URL honoured: vLLM, LM Studio, gateways)
-# or
-export OLLAMA_HOST=http://127.0.0.1:11434   # → Ollama
-# force one explicitly:
-export PM_ENGINE_PROVIDER=offline|anthropic|openai|ollama
+# Arena.ai — one command: stores the key in ~/.aura/pm-engine.env (0600, git-ignored), makes it the default, tests it
+pm-engine setup arena --key <YOUR_ARENA_API_KEY> --check
+#   options: --base-url https://…/v1   --model <id>   --api-format auto|openai|anthropic   --auth-header bearer|x-api-key
+#   (omit --key to be prompted without echo)
+
+pm-engine providers --check      # one tiny request per configured backend → "✓ arena: reachable — model …"
+pm-engine doctor --check         # full health check incl. the live provider round-trip
+pm-engine run "/write-prd SSO for enterprise" --stream
 ```
+
+Or configure through the environment / a `.env` file (see [`.env.example`](.env.example); real env vars always win, then `./.env`, then `~/.aura/pm-engine.env`):
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `ARENA_API_KEY` | Arena.ai key — when set, Arena is selected automatically | — |
+| `ARENA_BASE_URL` | API root of the Arena model endpoint | `https://api.arena.ai/v1` |
+| `ARENA_MODEL` | model id to request | `claude-sonnet-4-5` |
+| `ARENA_API_FORMAT` | wire format: `auto` (try OpenAI `chat/completions`, fall back to Anthropic `messages`) · `openai` · `anthropic` | `auto` |
+| `ARENA_AUTH_HEADER` | `bearer` (`Authorization: Bearer`) · `x-api-key` · any header name | `bearer` |
+| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` (+`OPENAI_BASE_URL`) / `OLLAMA_HOST` | other backends | — |
+| `PM_ENGINE_PROVIDER` | force `arena` · `anthropic` · `openai` · `ollama` · `offline` | auto |
+| `PM_ENGINE_MAX_RETRIES` | retries with back-off on 429/5xx/529 and network errors | `3` |
+
+Selection order when nothing is forced: `ARENA_API_KEY` → `ANTHROPIC_API_KEY` → `OPENAI_API_KEY` → `OLLAMA_HOST` → offline. Keys are never written to logs, sessions, artifacts or API responses (`/api/providers` only reports the base URL, model and a redacted check result).
+
+**Offline sandbox?** `python -m tests.mock_gateway --port 9001` starts a local stand-in that speaks both wire formats (`pm-engine setup arena --key test-arena-key --base-url http://127.0.0.1:9001/v1 --check`) — the same server the test-suite uses to prove the Arena path end-to-end.
 
 ## Use
 
@@ -84,7 +104,9 @@ pm-engine serve --port 8080         # JSON API + web UI (binds 0.0.0.0; UI strea
 pm-engine export cursor .           # → .cursor/skills/*  (also: claude gemini opencode kiro codex bundle prompts)
 pm-engine validate -v               # upstream spec + engine checks → exit 1 on errors
 pm-engine test                      # upstream validator + upstream unittest suite + engine pytest suite
-pm-engine doctor                    # environment, roots, counts, validation, provider, sessions — one screen
+pm-engine doctor [--check]          # environment, roots, counts, validation, provider (+ live round-trip), sessions
+pm-engine setup arena --key … --check   # store + verify Arena.ai credentials (also: setup anthropic|openai)
+pm-engine providers [--check]       # which backends are configured (+ one tiny request each)
 pm-engine update-skills             # re-vendor upstream main (updates pm-skills/UPSTREAM)
 
 # author your own plugins (written to ./aura-skills by default — picked up automatically)
@@ -119,7 +141,7 @@ Engine(Registry("pm-skills", extra_roots=["aura-skills", "~/my-skills"]))   # ex
 
 ### HTTP API
 
-`GET /api/health · /api/plugins[/name] · /api/skills[/ref] · /api/commands[/ref] · /api/search?q= · /api/graph · /api/validate · /api/providers · /api/sessions[/id]`
+`GET /api/health · /api/plugins[/name] · /api/skills[/ref] · /api/commands[/ref] · /api/search?q= · /api/graph · /api/validate · /api/providers[?check=1] · /api/sessions[/id]`
 `POST /api/resolve {text} · /api/prompt {text, step?} · /api/run {text, session_id?, step?, attachments?[{name,text}], skills?[]}`
 `POST /api/stream` — same body as `/api/run`, answers as Server-Sent Events: `event: chunk {text}` … then one `event: result {…RunResult}` (or `event: error {error}`).
 
@@ -130,7 +152,7 @@ cd AURA-PMSkills
 (cd pm-skills && python validate_plugins.py && python -m unittest discover -s tests)   # upstream: 110 components, 15 tests
 python pm-skills/validate_plugins.py aura-skills                                       # upstream validator on AURA's plugin: PASS
 pm-engine validate -v                                                                  # both roots: 10 plugins · 71 skills · 43 commands, 0 errors, 0 warnings
-python -m pytest tests -q                                                              # 146 passed
+python -m pytest tests -q                                                              # 163 passed (Arena path exercised against the mock gateway)
 pm-engine doctor                                                                       # "doctor: all good"
 ```
 

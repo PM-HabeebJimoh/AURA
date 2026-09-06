@@ -103,7 +103,7 @@ def test_offline_provider_skill_template(registry):
 
 
 def test_provider_selection(monkeypatch):
-    for k in ("PM_ENGINE_PROVIDER", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OLLAMA_HOST"):
+    for k in ("PM_ENGINE_PROVIDER", "ARENA_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OLLAMA_HOST"):
         monkeypatch.delenv(k, raising=False)
     assert isinstance(auto_provider(), OfflineProvider)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")

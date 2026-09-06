@@ -16,6 +16,8 @@
     pm-engine sessions [--delete ID]
     pm-engine new marketplace|plugin|skill|command <name> [--root DIR] [--plugin P] [--skill S ...]
     pm-engine doctor                                  # environment + marketplace health check
+    pm-engine setup arena [--key K] [--base-url U] [--model M] [--check]   # store credentials in ~/.aura/pm-engine.env
+    pm-engine providers [--check]                     # configured backends (+ live connectivity test)
 """
 
 from __future__ import annotations
@@ -31,7 +33,8 @@ from pathlib import Path
 from . import __version__
 from .export import export
 from .prompt import Attachment
-from .providers import ProviderError, auto_provider, available_providers, make_provider
+from .config import load_env_files, loaded_env_files, redact, save_env_values, user_env_file
+from .providers import ArenaProvider, ProviderError, auto_provider, available_providers, make_provider
 from .registry import Registry, RegistryError, default_extra_paths
 from .runner import Engine
 from .scaffold import ScaffoldError, new_command, new_marketplace, new_plugin, new_skill
@@ -326,18 +329,20 @@ def cmd_test(args) -> int:
     root = reg.root
     rc = 0
     print(f"▶ upstream validator ({root})")
-    rc |= subprocess.run([sys.executable, str(root / "validate_plugins.py")], cwd=root).returncode
+    env = {k: v for k, v in os.environ.items() if not (k.startswith(("ARENA_", "ANTHROPIC_", "OPENAI_", "OLLAMA_")) or k in ("PM_ENGINE_PROVIDER", "PM_ENGINE_ENV_FILE"))}
+    env["PM_ENGINE_PROVIDER"] = "offline"  # suites are hermetic: never touch a real model backend
+    rc |= subprocess.run([sys.executable, str(root / "validate_plugins.py")], cwd=root, env=env).returncode
     print("▶ upstream unittest suite")
-    rc |= subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v" if args.verbose else "-q"], cwd=root).returncode
+    rc |= subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v" if args.verbose else "-q"], cwd=root, env=env).returncode
     engine_tests = Path(__file__).resolve().parent.parent / "tests"
     if engine_tests.is_dir():
         print("▶ engine test suite")
         try:
             import pytest  # noqa: F401
 
-            rc |= subprocess.run([sys.executable, "-m", "pytest", str(engine_tests), "-q" if not args.verbose else "-v"], cwd=engine_tests.parent).returncode
+            rc |= subprocess.run([sys.executable, "-m", "pytest", str(engine_tests), "-q" if not args.verbose else "-v"], cwd=engine_tests.parent, env=env).returncode
         except ImportError:
-            rc |= subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", str(engine_tests), "-v" if args.verbose else "-q"], cwd=engine_tests.parent).returncode
+            rc |= subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", str(engine_tests), "-v" if args.verbose else "-q"], cwd=engine_tests.parent, env=env).returncode
     print("✓ all suites passed" if rc == 0 else "✗ failures")
     return rc
 
@@ -390,7 +395,99 @@ def cmd_sessions(args) -> int:
 
 
 def cmd_providers(args) -> int:
-    _print(available_providers(), True)
+    load_env_files()
+    avail = available_providers()
+    if not getattr(args, "check", False):
+        _print(avail, True)
+        return 0
+    from .providers import no_retries
+
+    out: dict = {"available": avail, "env_files": [str(p) for p in loaded_env_files()], "checks": {}}
+    ok = True
+    for name, configured in avail.items():
+        if not configured or name == "offline":
+            continue
+        try:
+            prov = make_provider(name, **({"model": args.model} if getattr(args, "model", None) else {}))
+            if hasattr(prov, "check"):
+                res = prov.check()
+            else:
+                with no_retries():
+                    c = prov.complete("Reply with the single word OK.", [{"role": "user", "content": "ping"}], max_tokens=8, temperature=0)
+                res = {"ok": True, "model": c.model, "reply": c.text.strip()[:40], "latency_s": round(c.latency_s, 2)}
+        except ProviderError as e:
+            res = {"ok": False, "error": str(e)[:300], "status": e.status}
+        out["checks"][name] = res
+        ok = ok and bool(res.get("ok"))
+    if getattr(args, "json", False):
+        _print(out, True)
+    else:
+        for name, configured in avail.items():
+            mark = "✓" if configured else "·"
+            print(f"{mark} {name:<10} {'configured' if configured else 'not configured'}")
+        for name, res in out["checks"].items():
+            if res.get("ok"):
+                print(f"  ✓ {name}: reachable — model {res.get('model')}, replied {res.get('reply')!r} in {res.get('latency_s')}s" + (f" (format {res['format']})" if res.get("format") else ""))
+            else:
+                print(f"  ✗ {name}: {res.get('error')}")
+            if res.get("warning"):
+                print(f"    ⚠ {res['warning']}")
+    return 0 if ok else 1
+
+
+def cmd_setup(args) -> int:
+    """Store provider credentials in the user-level env file and (optionally) test them."""
+    import getpass
+
+    values: dict[str, str] = {}
+    if args.provider == "arena":
+        key = args.key or os.environ.get("ARENA_API_KEY_NEW") or ""
+        if not key:
+            if not sys.stdin.isatty():
+                print("error: pass --key (stdin is not a terminal)", file=sys.stderr)
+                return 2
+            key = getpass.getpass("Arena API key (input hidden): ").strip()
+        if not key:
+            print("error: empty key", file=sys.stderr)
+            return 2
+        values["ARENA_API_KEY"] = key
+        if args.base_url:
+            values["ARENA_BASE_URL"] = args.base_url.rstrip("/")
+        if args.model:
+            values["ARENA_MODEL"] = args.model
+        if args.api_format:
+            values["ARENA_API_FORMAT"] = args.api_format
+        if args.auth_header:
+            values["ARENA_AUTH_HEADER"] = args.auth_header
+        if not args.no_default:
+            values["PM_ENGINE_PROVIDER"] = "arena"
+    else:  # anthropic | openai
+        key = args.key or ""
+        if not key:
+            if not sys.stdin.isatty():
+                print("error: pass --key (stdin is not a terminal)", file=sys.stderr)
+                return 2
+            key = getpass.getpass(f"{args.provider} API key (input hidden): ").strip()
+        values[{"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}[args.provider]] = key
+        if args.base_url:
+            values[{"anthropic": "ANTHROPIC_BASE_URL", "openai": "OPENAI_BASE_URL"}[args.provider]] = args.base_url.rstrip("/")
+        if args.model:
+            values[{"anthropic": "PM_ENGINE_ANTHROPIC_MODEL", "openai": "PM_ENGINE_OPENAI_MODEL"}[args.provider]] = args.model
+        if not args.no_default:
+            values["PM_ENGINE_PROVIDER"] = args.provider
+    path = save_env_values(values, Path(args.env_file) if args.env_file else None)
+    print(f"saved {', '.join(k for k in values)} → {path}  (mode 0600; not tracked by git)")
+    for k in values:
+        if k.endswith("_KEY"):
+            print(f"  {k} = {redact(values[k])}")
+    if args.check:
+        print("checking connectivity…")
+        class _A:  # minimal namespace for cmd_providers
+            check = True
+            json = False
+            model = None
+        return cmd_providers(_A())
+    print("next: `pm-engine providers --check`  then  `pm-engine run \"/write-prd …\" --stream`")
     return 0
 
 
@@ -474,8 +571,28 @@ def cmd_doctor(args) -> int:
         ok = False
         print(f"  ✗ validation: {len(rep.errors)} errors — run `pm-engine validate`")
     prov = available_providers()
-    active = auto_provider()
-    print(f"  ✓ active provider: {active.name}/{active.model}" + ("  (offline scaffolds — set ANTHROPIC_API_KEY / OPENAI_API_KEY / OLLAMA_HOST for model output)" if active.name == "offline" else ""))
+    files = loaded_env_files()
+    if files:
+        print(f"  ✓ env files: {', '.join(str(f) for f in files)}")
+    else:
+        print(f"  · env files: none found (create one with `pm-engine setup arena` → {user_env_file()})")
+    try:
+        active = auto_provider()
+    except ProviderError as e:
+        ok = False
+        print(f"  ✗ provider configuration: {e}")
+        active = None
+    if active is not None:
+        print(f"  ✓ active provider: {active.name}/{active.model}" + ("  (offline scaffolds — run `pm-engine setup arena` or set ARENA_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY / OLLAMA_HOST for model output)" if active.name == "offline" else ""))
+        if isinstance(active, ArenaProvider):
+            print(f"    base url {active.base_url} · format {active.api_format} · key {redact(active.api_key)}")
+            if getattr(args, "check", False):
+                res = active.check()
+                if res.get("ok"):
+                    print(f"    ✓ reachable — model {res['model']} replied {res['reply']!r} in {res['latency_s']}s (format {res['format']})")
+                else:
+                    ok = False
+                    print(f"    ✗ not reachable: {res.get('error')}")
     for name, configured in prov.items():
         if name != "offline":
             print(f"    {'✓' if configured else '·'} {name}")
@@ -495,7 +612,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--marketplace", "-m", help="path to a marketplace / plugin directory (default: vendored pm-skills or $PM_SKILLS_PATH)")
     p.add_argument("--extra", action="append", help="additional marketplace/plugin directory to merge (repeatable; also $PM_SKILLS_EXTRA and ./aura-skills)")
     p.add_argument("--no-extra", action="store_true", help="load only the primary marketplace")
-    p.add_argument("--provider", choices=["anthropic", "openai", "ollama", "offline"], help="LLM backend (default: auto from env)")
+    p.add_argument("--provider", choices=["arena", "anthropic", "openai", "ollama", "offline"], help="LLM backend (default: auto from env / .env files)")
     p.add_argument("--model", help="model id for the provider")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -580,7 +697,21 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_sessions)
 
     s = sub.add_parser("providers", help="show which LLM providers are configured")
+    s.add_argument("--check", action="store_true", help="make one tiny request to every configured provider")
+    s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_providers)
+
+    s = sub.add_parser("setup", help="store an API key / endpoint for a provider (arena, anthropic, openai)")
+    s.add_argument("provider", choices=["arena", "anthropic", "openai"])
+    s.add_argument("--key", help="API key (omit to be prompted without echo)")
+    s.add_argument("--base-url", help="API base URL (arena default: https://api.arena.ai/v1)")
+    s.add_argument("--model", help="default model id")
+    s.add_argument("--api-format", choices=["auto", "openai", "anthropic"], help="arena wire format (default auto-detect)")
+    s.add_argument("--auth-header", help="arena auth header: bearer (default) | x-api-key | <custom header name>")
+    s.add_argument("--env-file", help="where to save (default: ~/.aura/pm-engine.env or $PM_ENGINE_HOME/pm-engine.env)")
+    s.add_argument("--no-default", action="store_true", help="do not make this the default provider (PM_ENGINE_PROVIDER)")
+    s.add_argument("--check", action="store_true", help="test the connection after saving")
+    s.set_defaults(fn=cmd_setup)
 
     s = sub.add_parser("new", help="scaffold a marketplace, plugin, skill, or command in the upstream format")
     s.add_argument("kind", choices=["marketplace", "plugin", "skill", "command"])
@@ -596,16 +727,18 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_new)
 
     s = sub.add_parser("doctor", help="check environment, marketplace health, and provider configuration")
+    s.add_argument("--check", action="store_true", help="also make a live request to the active provider")
     s.set_defaults(fn=cmd_doctor)
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_env_files()
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
         return int(args.fn(args) or 0)
-    except RegistryError as e:
+    except (RegistryError, ProviderError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
 

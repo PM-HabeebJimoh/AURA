@@ -7,7 +7,12 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-os.environ.setdefault("PM_ENGINE_PROVIDER", "offline")
+# The suite must be hermetic: never pick up a developer's real keys or env files.
+for _k in list(os.environ):
+    if _k.startswith(("ARENA_", "ANTHROPIC_", "OPENAI_", "OLLAMA_")) or _k in ("PM_ENGINE_PROVIDER", "PM_ENGINE_ENV_FILE"):
+        del os.environ[_k]
+os.environ["PM_ENGINE_PROVIDER"] = "offline"
+os.environ["PM_ENGINE_ENV_FILE"] = os.devnull  # explicit file slot → nothing
 
 
 @pytest.fixture(scope="session")

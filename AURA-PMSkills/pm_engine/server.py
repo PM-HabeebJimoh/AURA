@@ -19,7 +19,7 @@ Endpoints (all JSON):
     GET  /api/sessions/<id>               one session (turns)
     DELETE /api/sessions/<id>
     GET  /api/validate                    spec + engine validation report
-    GET  /api/providers                   configured providers
+    GET  /api/providers[?check=1]         configured providers (+ live connectivity test; keys are never returned)
     GET  /                                web UI
 
 The UI is a static page (no build step) that talks to the API with relative
@@ -84,7 +84,25 @@ def create_app(engine: Engine | None = None) -> Flask:
 
     @app.get("/api/providers")
     def providers():  # type: ignore[no-untyped-def]
-        return jsonify({"active": {"provider": engine.provider.name, "model": engine.provider.model}, "available": available_providers()})
+        active: dict = {"provider": engine.provider.name, "model": engine.provider.model}
+        if hasattr(engine.provider, "base_url"):
+            active["base_url"] = getattr(engine.provider, "base_url")
+        if hasattr(engine.provider, "api_format"):
+            active["format"] = getattr(engine.provider, "_resolved", None) or getattr(engine.provider, "api_format")
+        body = {"active": active, "available": available_providers()}
+        if request.args.get("check") in ("1", "true", "yes") and engine.provider.name != "offline":
+            if hasattr(engine.provider, "check"):
+                body["check"] = engine.provider.check()
+            else:
+                from .providers import no_retries
+
+                try:
+                    with no_retries():
+                        c = engine.provider.complete("Reply with the single word OK.", [{"role": "user", "content": "ping"}], max_tokens=8, temperature=0)
+                    body["check"] = {"ok": True, "model": c.model, "reply": c.text.strip()[:40], "latency_s": round(c.latency_s, 2)}
+                except ProviderError as e:
+                    body["check"] = {"ok": False, "error": str(e)[:300], "status": e.status}
+        return jsonify(body)
 
     @app.get("/api/validate")
     def validate():  # type: ignore[no-untyped-def]

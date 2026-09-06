@@ -6,3 +6,7 @@ build/
 dist/
 artifacts/
 .claude/
+# credentials — use `pm-engine setup arena` or copy .env.example → .env
+.env
+.env.*
+!.env.example
