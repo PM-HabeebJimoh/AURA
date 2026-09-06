@@ -1,0 +1,127 @@
+# AURA-PMSkills — PM Skills Marketplace + PM Engine
+
+This module brings the **[PM Skills Marketplace](https://github.com/phuryn/pm-skills)** (68 product-management skills and 42 chained workflows across 9 plugins, by Paweł Huryn) into AURA — and adds a **full engine** that can run that content anywhere, not only inside Claude Code.
+
+```
+AURA-PMSkills/
+├── pm-skills/          ← the marketplace, vendored verbatim from upstream (v2.1.0 @ 18468a9)
+│   ├── .claude-plugin/marketplace.json
+│   ├── pm-product-discovery/ … pm-ai-shipping/   (9 plugins: skills/*/SKILL.md + commands/*.md)
+│   ├── validate_plugins.py, tests/               (upstream validator + consistency suite)
+│   └── UPSTREAM                                  (pinned upstream commit)
+├── pm_engine/          ← the engine (pure Python, stdlib core)
+├── tests/              ← engine test-suite (125 tests)
+└── pyproject.toml      ← `pip install -e .` → `pm-engine` CLI
+```
+
+## What the engine does
+
+Upstream ships *content* that Claude Code interprets at runtime. The engine makes that content executable and inspectable on its own:
+
+| Capability | Module | Upstream behaviour it reproduces |
+|---|---|---|
+| Discover marketplaces → plugins → skills → commands | `registry.py` | plugin manifests, `SKILL.md` front matter, `commands/*.md` |
+| Route `/command`, `/plugin:command`, `/skill`, `/plugin:skill`, free text | `runner.py` | slash invocation & force-loading skills |
+| **Auto-load** the right skills from plain-English requests (BM25 + trigger phrases) | `search.py` | "skills are loaded automatically when relevant" |
+| Parse each command into an executable **workflow**: steps, modes, checkpoints, chained skills, output template, follow-up offers | `workflow.py` | `### Step N`, `[plan\|retro] <ctx>` modes, `**Checkpoint**`, "Offer Next Steps" |
+| Assemble system/user prompts, substitute `$ARGUMENTS`, delimit attachments as untrusted data | `prompt.py` | `$ARGUMENTS` placeholder, untrusted-input rule |
+| Execute with **Anthropic**, **OpenAI-compatible**, **Ollama**, or a deterministic **offline** provider | `providers.py` | — |
+| Persist multi-turn **sessions**; run a workflow one step at a time and pause at checkpoints | `session.py`, `runner.py` | checkpoint pauses |
+| **Export** skills to Claude / Cursor / Gemini CLI / OpenCode / Kiro / Codex (commands → skills) / JSON bundle / rendered prompts | `export.py` | README "Other AI assistants" section |
+| **Validate**: upstream plugin-spec checks + engine-level checks (unresolved skill refs, unparsable workflows, count drift) | `validator.py` | `validate_plugins.py` + `tests/` |
+| Re-vendor from upstream with a pinned commit | `updater.py` | — |
+| CLI, JSON API, web UI | `cli.py`, `server.py`, `static/` | — |
+
+## Install
+
+```bash
+cd AURA-PMSkills
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"          # flask + pyyaml + pytest; the engine core itself is stdlib-only
+pm-engine --version
+```
+
+Choose a model backend (optional — without a key the engine runs fully offline with template scaffolds):
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-…          # → Anthropic (default model claude-sonnet-4-5)
+# or
+export OPENAI_API_KEY=sk-…                  # → OpenAI-compatible (OPENAI_BASE_URL honoured: vLLM, LM Studio, gateways)
+# or
+export OLLAMA_HOST=http://127.0.0.1:11434   # → Ollama
+# force one explicitly:
+export PM_ENGINE_PROVIDER=offline|anthropic|openai|ollama
+```
+
+## Use
+
+```bash
+pm-engine list                      # 9 plugins · 68 skills · 42 commands
+pm-engine list commands --plugin pm-execution
+pm-engine show /discover            # command source + parsed workflow
+pm-engine workflow /sprint          # step graph incl. modes, checkpoints, offers, output template
+pm-engine search north star metric  # BM25 search over skills + commands
+pm-engine resolve "What are the riskiest assumptions for our AI assistant?"   # routing preview
+
+# run a command (all steps), a single step, or step-by-step with a saved session
+pm-engine run "/write-prd SSO support for enterprise customers" --out ./artifacts
+pm-engine run "/discover AI meeting summarizer for remote teams" --step 1 --save-session
+pm-engine run "Carry all 10 ideas forward" --session <id>        # continues at the next step
+pm-engine run "/plan-launch Dev productivity tool" --all-steps    # pauses at checkpoints
+
+# force a skill, auto-load skills from plain text, attach files
+pm-engine run "/lean-canvas Marketplace for freelance PMs"
+pm-engine run "Summarize this interview into JTBD and action items" --file interview.txt
+pm-engine run "/sprint retro The last sprint shipped late" --show-prompt
+
+pm-engine chat                      # interactive REPL with session memory
+pm-engine serve --port 8080         # JSON API + web UI (binds 0.0.0.0)
+pm-engine export cursor .           # → .cursor/skills/*  (also: claude gemini opencode kiro codex bundle prompts)
+pm-engine validate -v               # upstream spec + engine checks → exit 1 on errors
+pm-engine test                      # upstream validator + upstream unittest suite + engine pytest suite
+pm-engine update-skills             # re-vendor upstream main (updates pm-skills/UPSTREAM)
+```
+
+### Python API
+
+```python
+from pm_engine import Engine
+from pm_engine.session import Session
+
+engine = Engine()                                   # vendored marketplace + auto-selected provider
+print(engine.resolve("/brainstorm ideas existing Mobile banking"))
+
+s = Session.new()
+r = engine.run("/discover AI meeting summarizer", session=s, step=1)
+print(r.text, r.checkpoint, r.offers)
+r = engine.run("carry all ideas forward", session=s)  # → step 2
+
+wf = engine.workflow("/discover")                    # parsed workflow: steps, skills, checkpoints, template
+```
+
+### HTTP API
+
+`GET /api/health · /api/plugins[/name] · /api/skills[/ref] · /api/commands[/ref] · /api/search?q= · /api/graph · /api/validate · /api/providers · /api/sessions[/id]`
+`POST /api/resolve {text} · /api/prompt {text, step?} · /api/run {text, session_id?, step?, attachments?[{name,text}], skills?[]}`
+
+## Test & confirm
+
+```bash
+cd AURA-PMSkills
+(cd pm-skills && python validate_plugins.py && python -m unittest discover -s tests)   # upstream: 110 components, 15 tests
+pm-engine validate -v                                                                  # 0 errors, 0 warnings
+python -m pytest tests -q                                                              # 125 passed
+```
+
+CI runs the same three layers on Python 3.10–3.13 (`.github/workflows/pm-engine-tests.yml`).
+
+## Design notes
+
+* **Content is never modified.** `pm-skills/` is byte-identical to upstream (minus the 5 MB install GIF and upstream's CI workflow). Upstream's own validator and test-suite run unchanged against it, so the vendored copy is always a valid Claude Code / Codex marketplace: `claude plugin marketplace add ./AURA-PMSkills/pm-skills`.
+* **Upstream design rules are enforced at runtime**: skills referenced by a command are resolved *inside the same plugin only*; `$ARGUMENTS` is substituted in commands and skills, never in front matter; the model is told to suggest cross-plugin follow-ups in natural language.
+* **Offline provider** produces deterministic scaffolds from the command's output template / the skill's template, so the whole pipeline is testable in CI without network or keys, and clearly labels itself as a scaffold.
+* Attachments are wrapped in `<attachment>` blocks and the system prompt carries upstream's untrusted-input rule.
+
+## License
+
+Engine: MIT. Marketplace content: MIT © Paweł Huryn (see `pm-skills/LICENSE`).

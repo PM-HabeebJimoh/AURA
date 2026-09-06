@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aura-pm-engine"
+version = "1.0.0"
+description = "AURA PM Engine — a runtime that executes the PM Skills marketplace (phuryn/pm-skills) anywhere: CLI, API, web UI, any LLM."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "AURA" }]
+keywords = ["product-management", "pm-skills", "claude-code", "skills", "agents", "prompts"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+# The engine core is dependency-free. Flask powers the API/UI; PyYAML improves front-matter fidelity.
+dependencies = ["flask>=2.3"]
+
+[project.optional-dependencies]
+yaml = ["pyyaml>=6"]
+dev = ["pytest>=7", "pyyaml>=6"]
+
+[project.scripts]
+pm-engine = "pm_engine.cli:main"
+
+[tool.setuptools]
+packages = ["pm_engine"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+pm_engine = ["static/*.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
