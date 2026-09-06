@@ -16,10 +16,24 @@ def marketplace_path() -> Path:
 
 
 @pytest.fixture(scope="session")
+def aura_skills_path() -> Path:
+    return ROOT / "aura-skills"
+
+
+@pytest.fixture(scope="session")
 def registry(marketplace_path):
+    """The vendored upstream marketplace only (pinned upstream counts: 9 / 68 / 42)."""
     from pm_engine.registry import Registry
 
-    return Registry(marketplace_path)
+    return Registry(marketplace_path, extra_roots=())
+
+
+@pytest.fixture(scope="session")
+def merged_registry(marketplace_path, aura_skills_path):
+    """Upstream + AURA's own ``aura-skills`` marketplace, as the CLI/server see it by default."""
+    from pm_engine.registry import Registry
+
+    return Registry(marketplace_path, extra_roots=[aura_skills_path])
 
 
 @pytest.fixture(scope="session")

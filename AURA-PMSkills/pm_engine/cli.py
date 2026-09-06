@@ -14,6 +14,8 @@
     pm-engine serve [--host 0.0.0.0] [--port 8080]    # JSON API + web UI
     pm-engine update-skills [--ref main]              # re-vendor upstream
     pm-engine sessions [--delete ID]
+    pm-engine new marketplace|plugin|skill|command <name> [--root DIR] [--plugin P] [--skill S ...]
+    pm-engine doctor                                  # environment + marketplace health check
 """
 
 from __future__ import annotations
@@ -30,15 +32,22 @@ from . import __version__
 from .export import export
 from .prompt import Attachment
 from .providers import ProviderError, auto_provider, available_providers, make_provider
-from .registry import Registry, RegistryError
+from .registry import Registry, RegistryError, default_extra_paths
 from .runner import Engine
+from .scaffold import ScaffoldError, new_command, new_marketplace, new_plugin, new_skill
 from .session import Session
 from .validator import validate_all
 from .workflow import parse_workflow
 
 
 def _registry(args) -> Registry:
-    return Registry(args.marketplace) if getattr(args, "marketplace", None) else Registry()
+    root = getattr(args, "marketplace", None)
+    extra = getattr(args, "extra", None)
+    if getattr(args, "no_extra", False):
+        return Registry(root, extra_roots=())
+    if extra:
+        return Registry(root, extra_roots=[*default_extra_paths(), *extra])
+    return Registry(root)
 
 
 def _engine(args) -> Engine:
@@ -203,6 +212,20 @@ def cmd_run(args) -> int:
         if args.all_steps:
             results = eng.run_all_steps(text, session=session, attachments=atts, max_tokens=args.max_tokens, progress=log, on_step=lambda r: (print(r.text), print(f"\n⏸ {r.checkpoint}\n") if r.checkpoint else None, True)[-1])
             r = results[-1]
+        elif args.stream and not args.json:
+            r = None
+            if args.show_prompt:
+                pv = eng.resolve(text)
+                print(f"# routing: {json.dumps(pv)}", file=sys.stderr)
+            for item in eng.stream(text, attachments=atts, session=session, step=args.step, extra_skills=args.skill or [], max_tokens=args.max_tokens, progress=log):
+                if isinstance(item, str):
+                    sys.stdout.write(item)
+                    sys.stdout.flush()
+                else:
+                    r = item
+            print()
+            if r and r.checkpoint:
+                print(f"\n⏸ Checkpoint: {r.checkpoint}")
         else:
             r = eng.run(text, attachments=atts, session=session, step=args.step, extra_skills=args.skill or [], max_tokens=args.max_tokens, progress=log)
             if args.json:
@@ -256,12 +279,20 @@ def cmd_chat(args) -> int:
             print(f"attached {att.name} ({len(att.text)} chars)")
             continue
         try:
-            r = eng.run(line, session=session, progress=lambda m: print(f"  · {m}"))
+            print()
+            r = None
+            for item in eng.stream(line, session=session, progress=lambda m: print(f"  · {m}")):
+                if isinstance(item, str):
+                    sys.stdout.write(item)
+                    sys.stdout.flush()
+                else:
+                    r = item
+            print()
         except (RegistryError, ProviderError, ValueError) as e:
             print(f"error: {e}")
             continue
-        print()
-        print(r.text)
+        if r is None:
+            continue
         if r.checkpoint:
             print(f"\n⏸ {r.checkpoint}")
         if r.offers:
@@ -363,6 +394,98 @@ def cmd_providers(args) -> int:
     return 0
 
 
+def _default_authoring_root() -> Path:
+    return Path(__file__).resolve().parent.parent / "aura-skills"
+
+
+def cmd_new(args) -> int:
+    root = Path(args.root).expanduser().resolve() if args.root else _default_authoring_root()
+    try:
+        if args.kind == "marketplace":
+            created = new_marketplace(root, args.name, owner=args.author, description=args.description or "")
+        elif args.kind == "plugin":
+            if not (root / ".claude-plugin" / "marketplace.json").is_file():
+                new_marketplace(root, root.name if _NAME_OK(root.name) else "aura-skills", owner=args.author)
+                print(f"created marketplace at {root}", file=sys.stderr)
+            created = new_plugin(root, args.name, description=args.description or "", author=args.author)
+        else:
+            if not args.plugin:
+                print("error: --plugin is required for skills and commands", file=sys.stderr)
+                return 2
+            pdir = root / args.plugin
+            if not pdir.is_dir():
+                print(f"error: plugin '{args.plugin}' not found under {root} (create it with: pm-engine new plugin {args.plugin})", file=sys.stderr)
+                return 2
+            if args.kind == "skill":
+                created = new_skill(pdir, args.name, description=args.description or "", triggers=args.triggers or "")
+            else:
+                created = new_command(pdir, args.name, description=args.description or "", argument_hint=args.argument_hint, skills=args.skill or [])
+    except ScaffoldError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    if args.json:
+        _print(created.to_dict(), True)
+    else:
+        print(f"created {created.kind}: {created.path}")
+        for f in created.files:
+            print(f"  {f}")
+        if created.kind in ("skill", "command"):
+            print("next: edit the file, then run `pm-engine validate -v`")
+    return 0
+
+
+def _NAME_OK(name: str) -> bool:
+    import re as _re
+
+    return bool(_re.match(r"^[a-z0-9]+(?:-[a-z0-9]+)*$", name))
+
+
+def cmd_doctor(args) -> int:
+    import platform
+
+    ok = True
+    print(f"pm-engine {__version__} · Python {platform.python_version()} · {platform.system()} {platform.machine()}")
+    for mod, why in (("flask", "API + web UI"), ("yaml", "front-matter fidelity (optional)"), ("pytest", "engine tests (dev)")):
+        try:
+            __import__(mod)
+            print(f"  ✓ {mod:<8} available   ({why})")
+        except ImportError:
+            print(f"  · {mod:<8} missing     ({why})")
+    try:
+        reg = _registry(args)
+    except (RegistryError, OSError, ValueError) as e:
+        print(f"  ✗ registry failed to load: {e}")
+        return 1
+    st = reg.stats()
+    print(f"  ✓ primary marketplace: {st['root']}  ({st['marketplace']['name'] + ' v' + st['marketplace']['version'] if st['marketplace'] else 'bare plugin dir'})")
+    for r in st["extra_roots"]:
+        print(f"  ✓ extra root: {r}")
+    print(f"  ✓ {st['plugins']} plugins · {st['skills']} skills · {st['commands']} commands")
+    up = reg.root / "UPSTREAM"
+    if up.is_file():
+        from .updater import current_upstream
+
+        info = current_upstream(reg.root)
+        print(f"  ✓ vendored upstream: {info.get('commit', '?')[:12]} (v{info.get('version', '?')})")
+    rep = validate_all(reg)
+    if rep.ok:
+        print(f"  ✓ validation passed ({len(rep.warnings)} warnings)")
+    else:
+        ok = False
+        print(f"  ✗ validation: {len(rep.errors)} errors — run `pm-engine validate`")
+    prov = available_providers()
+    active = auto_provider()
+    print(f"  ✓ active provider: {active.name}/{active.model}" + ("  (offline scaffolds — set ANTHROPIC_API_KEY / OPENAI_API_KEY / OLLAMA_HOST for model output)" if active.name == "offline" else ""))
+    for name, configured in prov.items():
+        if name != "offline":
+            print(f"    {'✓' if configured else '·'} {name}")
+    from .session import sessions_dir
+
+    print(f"  ✓ sessions dir: {sessions_dir()} ({len(list(Session.list()))} sessions)")
+    print("doctor: " + ("all good" if ok else "issues found"))
+    return 0 if ok else 1
+
+
 # ─── parser ──────────────────────────────────────────────────────────────────
 
 
@@ -370,6 +493,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="pm-engine", description="AURA PM Engine — run the PM Skills marketplace anywhere.")
     p.add_argument("--version", action="version", version=f"pm-engine {__version__}")
     p.add_argument("--marketplace", "-m", help="path to a marketplace / plugin directory (default: vendored pm-skills or $PM_SKILLS_PATH)")
+    p.add_argument("--extra", action="append", help="additional marketplace/plugin directory to merge (repeatable; also $PM_SKILLS_EXTRA and ./aura-skills)")
+    p.add_argument("--no-extra", action="store_true", help="load only the primary marketplace")
     p.add_argument("--provider", choices=["anthropic", "openai", "ollama", "offline"], help="LLM backend (default: auto from env)")
     p.add_argument("--model", help="model id for the provider")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -413,6 +538,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--out", help="directory to save artifacts")
     s.add_argument("--max-tokens", type=int, default=4096)
     s.add_argument("--show-prompt", action="store_true")
+    s.add_argument("--stream", action="store_true", help="stream the response as it is generated")
     s.add_argument("--json", action="store_true")
     s.add_argument("--quiet", "-q", action="store_true")
     s.set_defaults(fn=cmd_run)
@@ -455,6 +581,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("providers", help="show which LLM providers are configured")
     s.set_defaults(fn=cmd_providers)
+
+    s = sub.add_parser("new", help="scaffold a marketplace, plugin, skill, or command in the upstream format")
+    s.add_argument("kind", choices=["marketplace", "plugin", "skill", "command"])
+    s.add_argument("name", help="kebab-case name")
+    s.add_argument("--root", help="authoring marketplace directory (default: AURA-PMSkills/aura-skills)")
+    s.add_argument("--plugin", help="plugin to add the skill/command to")
+    s.add_argument("--description", "-d")
+    s.add_argument("--triggers", help="skill trigger sentence ('Use when …')")
+    s.add_argument("--argument-hint", default="<product, feature, or question>")
+    s.add_argument("--skill", action="append", help="skill(s) the new command chains (must exist in the same plugin)")
+    s.add_argument("--author", default="AURA")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_new)
+
+    s = sub.add_parser("doctor", help="check environment, marketplace health, and provider configuration")
+    s.set_defaults(fn=cmd_doctor)
     return p
 
 

@@ -93,7 +93,7 @@ def test_further_reading_links(registry):
 
 
 def test_registry_on_single_plugin_dir(marketplace_path):
-    reg = Registry(marketplace_path / "pm-toolkit")
+    reg = Registry(marketplace_path / "pm-toolkit", extra_roots=())
     assert set(reg.plugins) == {"pm-toolkit"}
     assert reg.marketplace is None
 
@@ -107,4 +107,4 @@ def test_to_dict_is_json_serialisable(registry):
 
 def test_env_override_path(monkeypatch, marketplace_path):
     monkeypatch.setenv("PM_SKILLS_PATH", str(marketplace_path))
-    assert Registry().root == marketplace_path.resolve()
+    assert Registry(extra_roots=()).root == marketplace_path.resolve()

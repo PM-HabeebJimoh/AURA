@@ -20,6 +20,7 @@ from typing import Iterable, Iterator
 from .frontmatter import Document, parse_frontmatter
 
 DEFAULT_MARKETPLACE_ENV = "PM_SKILLS_PATH"
+EXTRA_MARKETPLACES_ENV = "PM_SKILLS_EXTRA"  # os.pathsep-separated list of extra marketplace/plugin dirs
 
 
 def default_marketplace_path() -> Path:
@@ -38,6 +39,22 @@ def default_marketplace_path() -> Path:
     if (local / ".claude-plugin" / "marketplace.json").is_file():
         return local
     return Path.cwd()
+
+
+def default_extra_paths() -> list[Path]:
+    """Additional marketplaces/plugins merged on top of the default one.
+
+    ``$PM_SKILLS_EXTRA`` (``os.pathsep``-separated) plus ``<repo>/AURA-PMSkills/aura-skills``
+    when it exists — the place for AURA's own plugins, kept apart from the vendored copy.
+    """
+    out: list[Path] = []
+    env = os.environ.get(EXTRA_MARKETPLACES_ENV)
+    if env:
+        out.extend(Path(x).expanduser().resolve() for x in env.split(os.pathsep) if x.strip())
+    local = Path(__file__).resolve().parent.parent / "aura-skills"
+    if local.is_dir() and local not in out:
+        out.append(local)
+    return out
 
 
 # ─── Models ──────────────────────────────────────────────────────────────────
@@ -108,15 +125,15 @@ class Command:
 
     @property
     def referenced_skills(self) -> list[str]:
-        """Skill names referenced as ``**skill-name** skill`` / ``skills`` in the body,
-        plus any bold token that names a skill (``**brainstorm-ideas-new**``)."""
-        strict = re.findall(r"\*\*([a-z0-9][a-z0-9-]+)\*\*\s+skills?", self.body)
-        # "Apply the **a** and **b** skills" → both a and b
-        pairs = re.findall(r"\*\*([a-z0-9][a-z0-9-]+)\*\*\s+(?:and|or|,)\s+\*\*([a-z0-9][a-z0-9-]+)\*\*\s+skills?", self.body)
+        """Skill names referenced in the body as ``**skill-name** skill`` or in a
+        list such as ``Apply the **a**, **b** and **c** skills`` — in document order."""
+        token = r"\*\*([a-z0-9][a-z0-9-]+)\*\*"
+        group = re.compile(rf"(?:{token}\s*(?:,\s*|\s+(?:and|or)\s+|\s*)?)+skills?\b")
         out: list[str] = []
-        for s in strict + [p[0] for p in pairs] + [p[1] for p in pairs]:
-            if s not in out:
-                out.append(s)
+        for m in group.finditer(self.body):
+            for name in re.findall(token, m.group(0)):
+                if name not in out:
+                    out.append(name)
         return out
 
     @property
@@ -273,11 +290,23 @@ def load_plugin(plugin_dir: Path) -> Plugin:
 
 
 class Registry:
-    """All plugins, skills and commands of one marketplace directory."""
+    """All plugins, skills and commands of one or more marketplace directories.
 
-    def __init__(self, root: Path | str | None = None):
+    ``root`` is the primary marketplace (its ``marketplace.json`` becomes
+    :attr:`marketplace`). ``extra_roots`` are merged on top — each may be a
+    marketplace directory or a bare plugin directory. When ``extra_roots`` is
+    ``None`` the defaults from :func:`default_extra_paths` apply; pass ``()``
+    to load the primary root only.
+    """
+
+    def __init__(self, root: Path | str | None = None, extra_roots: Iterable[Path | str] | None = None):
         self.root = Path(root).expanduser().resolve() if root else default_marketplace_path()
+        if extra_roots is None:
+            self.extra_roots = [p for p in default_extra_paths() if p != self.root]
+        else:
+            self.extra_roots = [Path(p).expanduser().resolve() for p in extra_roots]
         self.marketplace: Marketplace | None = None
+        self.marketplaces: dict[Path, Marketplace] = {}
         self.plugins: dict[str, Plugin] = {}
         self._skills_by_name: dict[str, list[Skill]] = {}
         self._commands_by_name: dict[str, list[Command]] = {}
@@ -285,51 +314,87 @@ class Registry:
 
     # -- loading ---------------------------------------------------------
 
-    def load(self) -> "Registry":
-        self.plugins = {}
-        self._skills_by_name = {}
-        self._commands_by_name = {}
-        mp_path = self.root / ".claude-plugin" / "marketplace.json"
-        entries: list[dict] = []
-        if mp_path.is_file():
-            data = json.loads(mp_path.read_text(encoding="utf-8"))
-            entries = list(data.get("plugins", []))
-            self.marketplace = Marketplace(
-                name=data.get("name", self.root.name),
+    @staticmethod
+    def _read_marketplace(root: Path) -> tuple[Marketplace | None, list[dict]]:
+        mp_path = root / ".claude-plugin" / "marketplace.json"
+        if not mp_path.is_file():
+            return None, []
+        data = json.loads(mp_path.read_text(encoding="utf-8"))
+        entries = list(data.get("plugins", []))
+        return (
+            Marketplace(
+                name=data.get("name", root.name),
                 version=str(data.get("version", "")),
                 description=data.get("description", ""),
                 owner=data.get("owner", {}),
                 path=mp_path,
                 plugin_entries=tuple(entries),
-            )
-        else:
-            self.marketplace = None
+            ),
+            entries,
+        )
 
+    @staticmethod
+    def _plugin_dirs(root: Path, entries: list[dict]) -> list[Path]:
         plugin_dirs: list[Path] = []
         for e in entries:
             src = e.get("source")
             if isinstance(src, str):
-                cand = (self.root / src).resolve()
+                cand = (root / src).resolve()
                 if (cand / ".claude-plugin" / "plugin.json").is_file():
                     plugin_dirs.append(cand)
         # also pick up unlisted plugin directories (dev convenience)
-        for p in sorted(self.root.iterdir()) if self.root.is_dir() else []:
+        for p in sorted(root.iterdir()) if root.is_dir() else []:
             if p.is_dir() and (p / ".claude-plugin" / "plugin.json").is_file() and p not in plugin_dirs:
                 plugin_dirs.append(p)
         # a bare plugin directory passed as root
-        if not plugin_dirs and (self.root / ".claude-plugin" / "plugin.json").is_file():
-            plugin_dirs.append(self.root)
+        if not plugin_dirs and (root / ".claude-plugin" / "plugin.json").is_file():
+            plugin_dirs.append(root)
+        return plugin_dirs
 
-        for pd in plugin_dirs:
+    def _load_root(self, root: Path, primary: bool) -> None:
+        mp, entries = self._read_marketplace(root)
+        if mp:
+            self.marketplaces[root] = mp
+        if primary:
+            self.marketplace = mp
+        for pd in self._plugin_dirs(root, entries):
             plugin = load_plugin(pd)
+            if plugin.name in self.plugins:
+                raise RegistryError(f"duplicate plugin '{plugin.name}': {self.plugins[plugin.name].path} and {pd}")
             self.plugins[plugin.name] = plugin
             for s in plugin.skills.values():
                 self._skills_by_name.setdefault(s.name, []).append(s)
             for c in plugin.commands.values():
                 self._commands_by_name.setdefault(c.name, []).append(c)
+
+    def load(self) -> "Registry":
+        self.plugins = {}
+        self.marketplaces = {}
+        self.marketplace = None
+        self._skills_by_name = {}
+        self._commands_by_name = {}
+        self._load_root(self.root, primary=True)
+        for extra in self.extra_roots:
+            if extra.is_dir():
+                self._load_root(extra, primary=False)
         return self
 
     reload = load
+
+    @property
+    def roots(self) -> list[Path]:
+        return [self.root, *self.extra_roots]
+
+    def plugin_root(self, plugin: "Plugin | str") -> Path:
+        """Which registered root a plugin was loaded from."""
+        p = plugin if isinstance(plugin, Plugin) else self.get_plugin(plugin)
+        for r in self.roots:
+            try:
+                p.path.relative_to(r)
+                return r
+            except ValueError:
+                continue
+        return p.path.parent
 
     # -- lookups ---------------------------------------------------------
 
@@ -410,7 +475,9 @@ class Registry:
     def stats(self) -> dict:
         return {
             "root": str(self.root),
+            "extra_roots": [str(r) for r in self.extra_roots],
             "marketplace": self.marketplace.to_dict() if self.marketplace else None,
+            "marketplaces": [m.to_dict() for m in self.marketplaces.values()],
             "plugins": len(self.plugins),
             "skills": sum(len(p.skills) for p in self.plugins.values()),
             "commands": sum(len(p.commands) for p in self.plugins.values()),

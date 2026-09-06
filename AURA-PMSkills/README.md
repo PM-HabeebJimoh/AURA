@@ -9,8 +9,10 @@ AURA-PMSkills/
 │   ├── pm-product-discovery/ … pm-ai-shipping/   (9 plugins: skills/*/SKILL.md + commands/*.md)
 │   ├── validate_plugins.py, tests/               (upstream validator + consistency suite)
 │   └── UPSTREAM                                  (pinned upstream commit)
+├── aura-skills/        ← AURA's own marketplace (same spec) — merged on top of pm-skills automatically
+│   └── aura-architecture/   (3 skills + `/design-brief` workflow: floor-plan brief → design score → cost check)
 ├── pm_engine/          ← the engine (pure Python, stdlib core)
-├── tests/              ← engine test-suite (125 tests)
+├── tests/              ← engine test-suite (146 tests)
 └── pyproject.toml      ← `pip install -e .` → `pm-engine` CLI
 ```
 
@@ -25,10 +27,12 @@ Upstream ships *content* that Claude Code interprets at runtime. The engine make
 | **Auto-load** the right skills from plain-English requests (BM25 + trigger phrases) | `search.py` | "skills are loaded automatically when relevant" |
 | Parse each command into an executable **workflow**: steps, modes, checkpoints, chained skills, output template, follow-up offers | `workflow.py` | `### Step N`, `[plan\|retro] <ctx>` modes, `**Checkpoint**`, "Offer Next Steps" |
 | Assemble system/user prompts, substitute `$ARGUMENTS`, delimit attachments as untrusted data | `prompt.py` | `$ARGUMENTS` placeholder, untrusted-input rule |
-| Execute with **Anthropic**, **OpenAI-compatible**, **Ollama**, or a deterministic **offline** provider | `providers.py` | — |
+| Execute with **Anthropic**, **OpenAI-compatible**, **Ollama**, or a deterministic **offline** provider — **streaming** on every backend, retries with back-off on 429/5xx/529 | `providers.py` | — |
 | Persist multi-turn **sessions**; run a workflow one step at a time and pause at checkpoints | `session.py`, `runner.py` | checkpoint pauses |
 | **Export** skills to Claude / Cursor / Gemini CLI / OpenCode / Kiro / Codex (commands → skills) / JSON bundle / rendered prompts | `export.py` | README "Other AI assistants" section |
 | **Validate**: upstream plugin-spec checks + engine-level checks (unresolved skill refs, unparsable workflows, count drift) | `validator.py` | `validate_plugins.py` + `tests/` |
+| Merge **several marketplaces** (vendored `pm-skills` + `aura-skills` + `$PM_SKILLS_EXTRA` / `--extra`) into one namespace; duplicates are an error | `registry.py` | multiple `/plugin marketplace add` |
+| **Scaffold** spec-compliant marketplaces, plugins, skills and commands (`pm-engine new`) | `scaffold.py` | upstream plugin conventions |
 | Re-vendor from upstream with a pinned commit | `updater.py` | — |
 | CLI, JSON API, web UI | `cli.py`, `server.py`, `static/` | — |
 
@@ -74,12 +78,20 @@ pm-engine run "/lean-canvas Marketplace for freelance PMs"
 pm-engine run "Summarize this interview into JTBD and action items" --file interview.txt
 pm-engine run "/sprint retro The last sprint shipped late" --show-prompt
 
-pm-engine chat                      # interactive REPL with session memory
-pm-engine serve --port 8080         # JSON API + web UI (binds 0.0.0.0)
+pm-engine run "/design-brief 3-bed bungalow, 450 sqm plot, Abuja, ₦45m" --stream   # AURA plugin, tokens as they arrive
+pm-engine chat                      # interactive REPL with session memory (streams)
+pm-engine serve --port 8080         # JSON API + web UI (binds 0.0.0.0; UI streams via /api/stream)
 pm-engine export cursor .           # → .cursor/skills/*  (also: claude gemini opencode kiro codex bundle prompts)
 pm-engine validate -v               # upstream spec + engine checks → exit 1 on errors
 pm-engine test                      # upstream validator + upstream unittest suite + engine pytest suite
+pm-engine doctor                    # environment, roots, counts, validation, provider, sessions — one screen
 pm-engine update-skills             # re-vendor upstream main (updates pm-skills/UPSTREAM)
+
+# author your own plugins (written to ./aura-skills by default — picked up automatically)
+pm-engine new plugin aura-architecture -d "…"
+pm-engine new skill floor-plan-brief --plugin aura-architecture -d "…" --triggers "Use when …"
+pm-engine new command design-brief --plugin aura-architecture --skill floor-plan-brief -d "…"
+pm-engine --extra ~/my-skills list  # merge any other marketplace / plugin dir (or $PM_SKILLS_EXTRA); --no-extra = upstream only
 ```
 
 ### Python API
@@ -97,20 +109,29 @@ print(r.text, r.checkpoint, r.offers)
 r = engine.run("carry all ideas forward", session=s)  # → step 2
 
 wf = engine.workflow("/discover")                    # parsed workflow: steps, skills, checkpoints, template
+
+for item in engine.stream("/write-prd SSO", session=s):   # str chunks…, then the final RunResult
+    print(item, end="") if isinstance(item, str) else print("\n", item.artifact)
+
+from pm_engine.registry import Registry
+Engine(Registry("pm-skills", extra_roots=["aura-skills", "~/my-skills"]))   # explicit multi-root
 ```
 
 ### HTTP API
 
 `GET /api/health · /api/plugins[/name] · /api/skills[/ref] · /api/commands[/ref] · /api/search?q= · /api/graph · /api/validate · /api/providers · /api/sessions[/id]`
 `POST /api/resolve {text} · /api/prompt {text, step?} · /api/run {text, session_id?, step?, attachments?[{name,text}], skills?[]}`
+`POST /api/stream` — same body as `/api/run`, answers as Server-Sent Events: `event: chunk {text}` … then one `event: result {…RunResult}` (or `event: error {error}`).
 
 ## Test & confirm
 
 ```bash
 cd AURA-PMSkills
 (cd pm-skills && python validate_plugins.py && python -m unittest discover -s tests)   # upstream: 110 components, 15 tests
-pm-engine validate -v                                                                  # 0 errors, 0 warnings
-python -m pytest tests -q                                                              # 125 passed
+python pm-skills/validate_plugins.py aura-skills                                       # upstream validator on AURA's plugin: PASS
+pm-engine validate -v                                                                  # both roots: 10 plugins · 71 skills · 43 commands, 0 errors, 0 warnings
+python -m pytest tests -q                                                              # 146 passed
+pm-engine doctor                                                                       # "doctor: all good"
 ```
 
 A ready-made GitHub Actions workflow running the same three layers on Python 3.10–3.13 is in [`ci/pm-engine-tests.yml`](ci/README.md) — move it to `.github/workflows/` to enable it.
@@ -121,6 +142,8 @@ A ready-made GitHub Actions workflow running the same three layers on Python 3.1
 * **Upstream design rules are enforced at runtime**: skills referenced by a command are resolved *inside the same plugin only*; `$ARGUMENTS` is substituted in commands and skills, never in front matter; the model is told to suggest cross-plugin follow-ups in natural language.
 * **Offline provider** produces deterministic scaffolds from the command's output template / the skill's template, so the whole pipeline is testable in CI without network or keys, and clearly labels itself as a scaffold.
 * Attachments are wrapped in `<attachment>` blocks and the system prompt carries upstream's untrusted-input rule.
+* **Two roots, one namespace.** `pm-skills/` stays pristine so `pm-engine update-skills` is a clean re-vendor; AURA's own content lives in `aura-skills/` (its own `marketplace.json`, validated by the same upstream script, installable with `claude plugin marketplace add ./AURA-PMSkills/aura-skills`). The registry merges both; per-root README counts, marketplace listings and version sync are validated per root.
+* **Streaming is first-class.** Anthropic (`content_block_delta`), OpenAI (`choices[].delta`) and Ollama (`message.content`) stream natively; the offline provider chunks its scaffold; `Engine.stream()` yields text then the same `RunResult` as `run()`, so sessions, artifacts and offers behave identically.
 
 ## License
 

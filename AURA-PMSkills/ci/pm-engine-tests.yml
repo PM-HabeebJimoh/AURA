@@ -29,7 +29,11 @@ jobs:
       - name: Upstream consistency suite (vendored)
         run: python -m unittest discover -s tests -v
         working-directory: AURA-PMSkills/pm-skills
-      - name: Engine validate
+      - name: Upstream plugin validator (aura-skills)
+        run: python pm-skills/validate_plugins.py aura-skills
+      - name: Engine validate (pm-skills + aura-skills)
         run: pm-engine validate -v
+      - name: Engine doctor
+        run: pm-engine doctor
       - name: Engine test-suite
         run: python -m pytest tests -v

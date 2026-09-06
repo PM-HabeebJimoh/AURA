@@ -166,10 +166,10 @@ def test_upstream_validator_script_passes(marketplace_path):
 
 
 def test_cli_list_and_show(capsys, marketplace_path):
-    assert main(["-m", str(marketplace_path), "list"]) == 0
+    assert main(["-m", str(marketplace_path), "--no-extra", "list"]) == 0
     out = capsys.readouterr().out
     assert "Skills: 68" in out and "Commands: 42" in out
-    assert main(["-m", str(marketplace_path), "list", "commands", "--plugin", "pm-toolkit", "--json"]) == 0
+    assert main(["-m", str(marketplace_path), "--no-extra", "list", "commands", "--plugin", "pm-toolkit", "--json"]) == 0
     assert len(json.loads(capsys.readouterr().out)) == 5
     assert main(["-m", str(marketplace_path), "show", "/discover"]) == 0
     assert "Steps: 7" in capsys.readouterr().out
@@ -194,7 +194,7 @@ def test_cli_run_validate_export(capsys, marketplace_path, tmp_path, monkeypatch
     r = json.loads(capsys.readouterr().out)
     assert r["command"] == "pm-execution:write-prd" and Path(r["artifact"]).is_file()
     assert main(["-m", str(marketplace_path), "--provider", "offline", "run", "/writeprd", "SSO", "-q"]) == 2
-    assert main(["-m", str(marketplace_path), "validate"]) == 0
+    assert main(["-m", str(marketplace_path), "--no-extra", "validate"]) == 0
     assert "ALL CHECKS PASSED" in capsys.readouterr().out
     assert main(["-m", str(marketplace_path), "export", "cursor", str(tmp_path / "exp")]) == 0
     assert (tmp_path / "exp" / ".cursor" / "skills").is_dir()

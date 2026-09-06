@@ -114,27 +114,42 @@ def validate_engine(registry: Registry) -> Report:
     st = registry.stats()
     rep.info["registry"] = {"plugins": st["plugins"], "skills": st["skills"], "commands": st["commands"], "workflow_steps": steps_total}
 
-    readme = registry.root / "README.md"
-    if readme.is_file():
-        m = re.search(r"(\d+) PM skills and (\d+) chained workflows across (\d+) plugins", readme.read_text(encoding="utf-8"))
-        if m:
-            want = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
-            have = (st["skills"], st["commands"], st["plugins"])
-            if want != have:
-                rep.errors.append(f"README headline counts {want} != registry {have}")
-            rep.info["readme_counts"] = {"skills": want[0], "commands": want[1], "plugins": want[2]}
+    # per-root consistency: README counts, marketplace listing, version sync — each root judged on its own plugins
+    rep.info["roots"] = {}
+    for root in registry.roots:
+        if not root.is_dir():
+            continue
+        plugins_here = [p for p in registry.plugins.values() if registry.plugin_root(p) == root]
+        if not plugins_here:
+            continue
+        n_sk = sum(len(p.skills) for p in plugins_here)
+        n_cmd = sum(len(p.commands) for p in plugins_here)
+        info: dict = {"plugins": len(plugins_here), "skills": n_sk, "commands": n_cmd}
 
-    mp = registry.root / ".claude-plugin" / "marketplace.json"
-    if mp.is_file():
-        data = json.loads(mp.read_text(encoding="utf-8"))
-        listed = {p["name"] for p in data.get("plugins", [])}
-        on_disk = set(registry.plugins)
-        if listed != on_disk:
-            rep.errors.append(f"marketplace.json plugins {sorted(listed)} != disk {sorted(on_disk)}")
-        versions = {p.version for p in registry.plugins.values()} | {str(data.get("version", ""))}
-        if len(versions) > 1:
-            rep.warnings.append(f"version drift across manifests: {sorted(versions)}")
-        rep.info["version"] = data.get("version")
+        readme = root / "README.md"
+        if readme.is_file():
+            m = re.search(r"(\d+) PM skills and (\d+) chained workflows across (\d+) plugins", readme.read_text(encoding="utf-8"))
+            if m:
+                want = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                have = (n_sk, n_cmd, len(plugins_here))
+                if want != have:
+                    rep.errors.append(f"{root.name}/README.md headline counts {want} != disk {have}")
+                info["readme_counts"] = {"skills": want[0], "commands": want[1], "plugins": want[2]}
+
+        mp = root / ".claude-plugin" / "marketplace.json"
+        if mp.is_file():
+            data = json.loads(mp.read_text(encoding="utf-8"))
+            listed = {p["name"] for p in data.get("plugins", [])}
+            on_disk = {p.name for p in plugins_here}
+            if listed != on_disk:
+                rep.errors.append(f"{root.name}/marketplace.json plugins {sorted(listed)} != disk {sorted(on_disk)}")
+            versions = {p.version for p in plugins_here} | {str(data.get("version", ""))}
+            if len(versions) > 1:
+                rep.warnings.append(f"{root.name}: version drift across manifests: {sorted(versions)}")
+            info["version"] = data.get("version")
+            if root == registry.root:
+                rep.info["version"] = data.get("version")
+        rep.info["roots"][str(root)] = info
     return rep
 
 

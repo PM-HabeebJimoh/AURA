@@ -14,6 +14,7 @@ Endpoints (all JSON):
     POST /api/resolve   {text}            routing preview (no model call)
     POST /api/prompt    {text, step?}     assembled prompt (no model call)
     POST /api/run       {text, session_id?, step?, attachments?: [{name,text}], skills?: []}
+    POST /api/stream    same body as /api/run; Server-Sent Events: `chunk` events then one `result` event
     GET  /api/sessions                    saved sessions
     GET  /api/sessions/<id>               one session (turns)
     DELETE /api/sessions/<id>
@@ -27,10 +28,11 @@ URLs so it works behind any reverse proxy / preview host.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
-from flask import Flask, Response, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, request, send_from_directory, stream_with_context
 
 from . import __version__
 from .prompt import Attachment
@@ -206,6 +208,40 @@ def create_app(engine: Engine | None = None) -> Flask:
             save_artifact=bool(payload.get("save_artifact", True)),
         )
         return jsonify(r.to_dict(include_prompt=bool(payload.get("include_prompt"))))
+
+    @app.post("/api/stream")
+    def stream():  # type: ignore[no-untyped-def]
+        payload = request.get_json(force=True, silent=True) or {}
+        text = str(payload.get("text", ""))
+        session_id = payload.get("session_id")
+        session = Session.load(session_id) if session_id else (Session.new() if payload.get("save_session", True) else None)
+        step = payload.get("step")
+
+        def sse(event: str, data) -> str:
+            return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+        def generate():
+            try:
+                gen = engine.stream(
+                    text,
+                    attachments=_attachments(payload),
+                    session=session,
+                    step=int(step) if step else None,
+                    extra_skills=payload.get("skills") or [],
+                    max_tokens=int(payload.get("max_tokens", 4096)),
+                    temperature=float(payload.get("temperature", 0.4)),
+                    save_artifact=bool(payload.get("save_artifact", True)),
+                )
+                for item in gen:
+                    if isinstance(item, str):
+                        yield sse("chunk", {"text": item})
+                    else:
+                        yield sse("result", item.to_dict(include_prompt=bool(payload.get("include_prompt"))))
+            except (RegistryError, ProviderError, ValueError, FileNotFoundError) as e:
+                yield sse("error", {"error": str(e)})
+
+        headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"}
+        return Response(stream_with_context(generate()), mimetype="text/event-stream", headers=headers)
 
     # -- sessions --------------------------------------------------------
 

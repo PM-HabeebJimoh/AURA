@@ -25,13 +25,22 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Callable, Iterator, Protocol
 
+RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504, 529}
+MAX_RETRIES = int(os.environ.get("PM_ENGINE_MAX_RETRIES", "3"))
+
 DEFAULT_ANTHROPIC_MODEL = os.environ.get("PM_ENGINE_ANTHROPIC_MODEL", "claude-sonnet-4-5")
 DEFAULT_OPENAI_MODEL = os.environ.get("PM_ENGINE_OPENAI_MODEL", "gpt-4o-mini")
 DEFAULT_OLLAMA_MODEL = os.environ.get("PM_ENGINE_OLLAMA_MODEL", "llama3.1")
 
 
 class ProviderError(RuntimeError):
-    pass
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+    @property
+    def retryable(self) -> bool:
+        return self.status in RETRYABLE_STATUS or self.status is None and "network error" in str(self)
 
 
 @dataclass
@@ -61,18 +70,66 @@ class Provider(Protocol):
 
     def complete(self, system: str, messages: list[dict], *, max_tokens: int = 4096, temperature: float = 0.4) -> Completion: ...
 
+    def stream(self, system: str, messages: list[dict], *, max_tokens: int = 4096, temperature: float = 0.4) -> Iterator[str]: ...
 
-def _post_json(url: str, payload: dict, headers: dict, timeout: float = 180.0) -> dict:
+
+class _StreamMixin:
+    """Default ``stream`` for providers without native streaming: complete, then chunk."""
+
+    def stream(self, system: str, messages: list[dict], *, max_tokens: int = 4096, temperature: float = 0.4) -> Iterator[str]:
+        text = self.complete(system, messages, max_tokens=max_tokens, temperature=temperature).text  # type: ignore[attr-defined]
+        yield from iter_chunks(text)
+
+
+def _request(url: str, payload: dict, headers: dict, timeout: float):
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST", headers={"Content-Type": "application/json", **headers})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — https to configured API host
-            return json.loads(resp.read().decode("utf-8"))
+        return urllib.request.urlopen(req, timeout=timeout)  # noqa: S310 — https to configured API host
     except urllib.error.HTTPError as e:  # pragma: no cover - network
         detail = e.read().decode("utf-8", errors="replace")[:2000]
-        raise ProviderError(f"HTTP {e.code} from {url}: {detail}") from e
+        raise ProviderError(f"HTTP {e.code} from {url}: {detail}", status=e.code) from e
     except urllib.error.URLError as e:  # pragma: no cover - network
         raise ProviderError(f"network error calling {url}: {e.reason}") from e
+
+
+def _with_retries(fn: Callable[[], object], *, retries: int = MAX_RETRIES, base_delay: float = 1.0):
+    """Call *fn*, retrying transient provider errors with exponential backoff."""
+    attempt = 0
+    while True:
+        try:
+            return fn()
+        except ProviderError as e:
+            attempt += 1
+            if not e.retryable or attempt > retries:
+                raise
+            time.sleep(min(base_delay * (2 ** (attempt - 1)), 20.0))
+
+
+def _post_json(url: str, payload: dict, headers: dict, timeout: float = 180.0) -> dict:
+    def go() -> dict:
+        with _request(url, payload, headers, timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    return _with_retries(go)  # type: ignore[return-value]
+
+
+def _post_sse(url: str, payload: dict, headers: dict, timeout: float = 300.0) -> Iterator[dict]:
+    """POST and yield decoded JSON events from an SSE / NDJSON response body."""
+    resp = _with_retries(lambda: _request(url, payload, headers, timeout))
+    with resp:  # type: ignore[union-attr]
+        for raw in resp:  # type: ignore[union-attr]
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line or line.startswith(":") or line.startswith("event:"):
+                continue
+            if line.startswith("data:"):
+                line = line[5:].strip()
+            if line == "[DONE]":
+                return
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
 
 
 # ─── Anthropic ───────────────────────────────────────────────────────────────
@@ -100,6 +157,16 @@ class AnthropicProvider:
         usage = data.get("usage", {})
         return Completion(text=text, provider=self.name, model=data.get("model", self.model), input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"), latency_s=time.time() - t0, raw=data)
 
+    def stream(self, system: str, messages: list[dict], *, max_tokens: int = 4096, temperature: float = 0.4) -> Iterator[str]:
+        payload = {"model": self.model, "max_tokens": max_tokens, "temperature": temperature, "system": system, "messages": messages, "stream": True}
+        for ev in _post_sse(f"{self.base_url}/v1/messages", payload, {"x-api-key": self.api_key, "anthropic-version": "2023-06-01", "Accept": "text/event-stream"}):
+            if ev.get("type") == "content_block_delta":
+                delta = ev.get("delta") or {}
+                if delta.get("type") == "text_delta" and delta.get("text"):
+                    yield delta["text"]
+            elif ev.get("type") == "error":  # pragma: no cover - network
+                raise ProviderError(f"anthropic stream error: {ev.get('error')}")
+
 
 # ─── OpenAI-compatible (OpenAI, Azure-compatible gateways, LM Studio, vLLM…) ──
 
@@ -124,6 +191,15 @@ class OpenAIProvider:
         usage = data.get("usage", {})
         return Completion(text=text, provider=self.name, model=data.get("model", self.model), input_tokens=usage.get("prompt_tokens"), output_tokens=usage.get("completion_tokens"), latency_s=time.time() - t0, raw=data)
 
+    def stream(self, system: str, messages: list[dict], *, max_tokens: int = 4096, temperature: float = 0.4) -> Iterator[str]:
+        payload = {"model": self.model, "max_tokens": max_tokens, "temperature": temperature, "stream": True, "messages": [{"role": "system", "content": system}, *messages]}
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        for ev in _post_sse(f"{self.base_url}/chat/completions", payload, headers):
+            for choice in ev.get("choices") or []:
+                piece = (choice.get("delta") or {}).get("content")
+                if piece:
+                    yield piece
+
 
 # ─── Ollama ──────────────────────────────────────────────────────────────────
 
@@ -144,11 +220,20 @@ class OllamaProvider:
         text = (data.get("message") or {}).get("content", "")
         return Completion(text=text, provider=self.name, model=data.get("model", self.model), input_tokens=data.get("prompt_eval_count"), output_tokens=data.get("eval_count"), latency_s=time.time() - t0, raw=data)
 
+    def stream(self, system: str, messages: list[dict], *, max_tokens: int = 4096, temperature: float = 0.4) -> Iterator[str]:
+        payload = {"model": self.model, "stream": True, "options": {"temperature": temperature, "num_predict": max_tokens}, "messages": [{"role": "system", "content": system}, *messages]}
+        for ev in _post_sse(f"{self.host}/api/chat", payload, {}):
+            piece = (ev.get("message") or {}).get("content")
+            if piece:
+                yield piece
+            if ev.get("done"):
+                return
+
 
 # ─── Offline (deterministic; used by tests and when no key is configured) ────
 
 
-class OfflineProvider:
+class OfflineProvider(_StreamMixin):
     """Produces a structured, deterministic draft **without** any model.
 
     It reads the command's output template / skill instructions out of the
@@ -299,7 +384,7 @@ def available_providers() -> dict[str, bool]:
     }
 
 
-def iter_chunks(text: str, size: int = 400) -> Iterator[str]:
+def iter_chunks(text: str, size: int = 120) -> Iterator[str]:
     """Utility for pseudo-streaming a completed text to SSE clients."""
     for i in range(0, len(text), size):
         yield text[i : i + size]

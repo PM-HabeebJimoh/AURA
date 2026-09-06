@@ -211,17 +211,32 @@ function payload() {
 }
 $('#resolve').onclick = async () => { $('#routing').style.display = ''; $('#routing-pre').textContent = JSON.stringify(await api('/api/resolve', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload()) }), null, 2); };
 $('#prompt').onclick = async () => { const p = await api('/api/prompt', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload()) }); $('#routing').style.display = ''; $('#routing-pre').textContent = `# skills: ${p.skills.join(', ')}  command: ${p.command || '-'}  ~${p.approx_tokens} tokens\n\n=== SYSTEM ===\n${p.system}\n\n=== USER ===\n${p.user}`; };
+function showResult(r) {
+  sessionId = r.session?.id || sessionId; $('#session').textContent = sessionId ? `session ${sessionId}` : '';
+  $('#out-meta').textContent = `${r.completion.provider}/${r.completion.model} · ${r.command || (r.auto_loaded ? 'auto: ' : '') + r.skills.join(', ') || 'no skill'}${r.step ? ` · step ${r.step}/${r.total_steps}` : ''}${r.artifact ? ' · saved' : ''}`;
+  $('#out').innerHTML = md(r.text);
+  if (r.checkpoint) $('#checkpoint').textContent = '⏸ ' + r.checkpoint;
+  if (r.offers?.length) $('#offers').innerHTML = '<div class="muted" style="margin-top:8px">Next, I can:</div>' + r.offers.map(o => `<button class="secondary" onclick="useText(${JSON.stringify(o)})">${esc(o)}</button>`).join('');
+  if (r.step && r.step < r.total_steps) $('#step').value = r.step + 1;
+}
 $('#run').onclick = async () => {
-  const btn = $('#run'); btn.disabled = true; $('#output').style.display = ''; $('#out').innerHTML = '<span class="muted">running…</span>'; $('#offers').innerHTML = ''; $('#checkpoint').textContent = '';
+  const btn = $('#run'); btn.disabled = true; $('#output').style.display = ''; $('#out').innerHTML = '<span class="muted">running…</span>'; $('#offers').innerHTML = ''; $('#checkpoint').textContent = ''; $('#out-meta').textContent = 'streaming…';
   try {
-    const r = await api('/api/run', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload()) });
-    sessionId = r.session?.id || sessionId; $('#session').textContent = sessionId ? `session ${sessionId}` : '';
-    $('#out-meta').textContent = `${r.completion.provider}/${r.completion.model} · ${r.command || (r.auto_loaded ? 'auto: ' : '') + r.skills.join(', ') || 'no skill'}${r.step ? ` · step ${r.step}/${r.total_steps}` : ''}${r.artifact ? ' · saved' : ''}`;
-    $('#out').innerHTML = md(r.text);
-    if (r.checkpoint) $('#checkpoint').textContent = '⏸ ' + r.checkpoint;
-    if (r.offers?.length) $('#offers').innerHTML = '<div class="muted" style="margin-top:8px">Next, I can:</div>' + r.offers.map(o => `<button class="secondary" onclick="useText(${JSON.stringify(o)})">${esc(o)}</button>`).join('');
-    if (r.step && r.step < r.total_steps) $('#step').value = r.step + 1;
-  } catch (e) { $('#out').innerHTML = `<span class="err">${esc(e.message)}</span>`; }
+    const resp = await fetch('/api/stream', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload()) });
+    if (!resp.ok || !resp.body) { const j = await resp.json().catch(() => ({})); throw new Error(j.error || resp.statusText); }
+    const reader = resp.body.getReader(); const dec = new TextDecoder(); let buf = '', text = '', done = false;
+    while (!done) {
+      const { value, done: d } = await reader.read(); done = d; if (value) buf += dec.decode(value, { stream: true });
+      let idx; while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const frame = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        const ev = /^event: (\w+)/m.exec(frame)?.[1]; const dataLine = frame.split('\n').find(l => l.startsWith('data: '));
+        if (!ev || !dataLine) continue; const data = JSON.parse(dataLine.slice(6));
+        if (ev === 'chunk') { text += data.text; $('#out').innerHTML = md(text); }
+        else if (ev === 'result') showResult(data);
+        else if (ev === 'error') throw new Error(data.error);
+      }
+    }
+  } catch (e) { $('#out').innerHTML = `<span class="err">${esc(e.message)}</span>`; $('#out-meta').textContent = 'error'; }
   btn.disabled = false;
 };
 

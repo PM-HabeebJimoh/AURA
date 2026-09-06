@@ -1,0 +1,21 @@
+{
+  "name": "aura-architecture",
+  "version": "0.1.0",
+  "description": "AURA-specific PM skills for AI-driven architectural design: floor-plan briefs, design-quality scoring, and construction-cost sanity checks for the Nigerian market.",
+  "author": {
+    "name": "AURA",
+    "email": "aura@users.noreply.github.com",
+    "url": "https://github.com/PM-HabeebJimoh/AURA"
+  },
+  "keywords": [
+    "product-management",
+    "architecture",
+    "floor-plan",
+    "design-brief",
+    "construction-cost",
+    "nigeria",
+    "aura"
+  ],
+  "homepage": "https://github.com/PM-HabeebJimoh/AURA",
+  "license": "MIT"
+}

@@ -17,7 +17,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Iterable, Iterator, Sequence
 
 from .prompt import Attachment, Prompt, PromptBuilder, parse_slash
 from .providers import Completion, Provider, auto_provider
@@ -114,7 +114,7 @@ class Engine:
 
     # -- execution -------------------------------------------------------
 
-    def run(
+    def _prepare(
         self,
         text: str,
         *,
@@ -122,17 +122,9 @@ class Engine:
         session: Session | None = None,
         step: int | None = None,
         extra_skills: Sequence[str] = (),
-        max_tokens: int = 4096,
-        temperature: float = 0.4,
-        save_artifact: bool = True,
         progress: ProgressFn | None = None,
-    ) -> RunResult:
-        """Route and execute a single request.
-
-        ``step`` runs only one step of a command workflow (1-based). Passing a
-        ``session`` whose ``active_command`` is set and no slash in *text*
-        continues that command (next step).
-        """
+    ) -> dict:
+        """Route *text* and build the prompt. Shared by :meth:`run` and :meth:`stream`."""
         atts = list(attachments)
         extra = [self.registry.get_skill(s) for s in extra_skills]
         slash, rest = parse_slash(text)
@@ -186,9 +178,13 @@ class Engine:
             skills = prompt.skills
 
         messages = (session.messages() if session else []) + [{"role": "user", "content": prompt.user}]
-        t0 = time.time()
-        completion = self.provider.complete(prompt.system, messages, max_tokens=max_tokens, temperature=temperature)
-        log(f"{completion.provider}/{completion.model} responded in {time.time() - t0:.1f}s")
+        return {"prompt": prompt, "messages": messages, "command": command, "skills": skills, "mode": mode, "step": step, "total_steps": total_steps, "auto": auto, "slash": slash, "rest": rest, "text": text, "log": log}
+
+    def _finish(self, ctx: dict, completion: Completion, *, session: Session | None, save_artifact: bool) -> RunResult:
+        command: Command | None = ctx["command"]
+        skills: list[Skill] = ctx["skills"]
+        mode, step, total_steps, rest, slash = ctx["mode"], ctx["step"], ctx["total_steps"], ctx["rest"], ctx["slash"]
+        prompt: Prompt = ctx["prompt"]
 
         checkpoint: str | None = None
         offers: list[str] = []
@@ -217,12 +213,62 @@ class Engine:
 
         artifact: Path | None = None
         if save_artifact and self.artifacts_dir and (command or skills):
-            artifact = self._write_artifact(command, skills, rest or text, completion.text, step)
+            artifact = self._write_artifact(command, skills, rest or ctx["text"], completion.text, step)
             if session is not None:
                 session.artifacts.append(str(artifact))
                 session.save()
 
-        return RunResult(prompt=prompt, completion=completion, skills=skills, command=command, mode=mode, step=step, total_steps=total_steps, session=session, artifact=artifact, checkpoint=checkpoint, offers=offers, auto_loaded=auto)
+        return RunResult(prompt=prompt, completion=completion, skills=skills, command=command, mode=mode, step=step, total_steps=total_steps, session=session, artifact=artifact, checkpoint=checkpoint, offers=offers, auto_loaded=ctx["auto"])
+
+    def run(
+        self,
+        text: str,
+        *,
+        attachments: Iterable[Attachment] = (),
+        session: Session | None = None,
+        step: int | None = None,
+        extra_skills: Sequence[str] = (),
+        max_tokens: int = 4096,
+        temperature: float = 0.4,
+        save_artifact: bool = True,
+        progress: ProgressFn | None = None,
+    ) -> RunResult:
+        """Route and execute a single request.
+
+        ``step`` runs only one step of a command workflow (1-based). Passing a
+        ``session`` whose ``active_command`` is set and no slash in *text*
+        continues that command (next step).
+        """
+        ctx = self._prepare(text, attachments=attachments, session=session, step=step, extra_skills=extra_skills, progress=progress)
+        t0 = time.time()
+        completion = self.provider.complete(ctx["prompt"].system, ctx["messages"], max_tokens=max_tokens, temperature=temperature)
+        ctx["log"](f"{completion.provider}/{completion.model} responded in {time.time() - t0:.1f}s")
+        return self._finish(ctx, completion, session=session, save_artifact=save_artifact)
+
+    def stream(
+        self,
+        text: str,
+        *,
+        attachments: Iterable[Attachment] = (),
+        session: Session | None = None,
+        step: int | None = None,
+        extra_skills: Sequence[str] = (),
+        max_tokens: int = 4096,
+        temperature: float = 0.4,
+        save_artifact: bool = True,
+        progress: ProgressFn | None = None,
+    ) -> Iterator[str | RunResult]:
+        """Like :meth:`run` but yields text chunks as they arrive; the final item is the :class:`RunResult`."""
+        ctx = self._prepare(text, attachments=attachments, session=session, step=step, extra_skills=extra_skills, progress=progress)
+        t0 = time.time()
+        pieces: list[str] = []
+        for chunk in self.provider.stream(ctx["prompt"].system, ctx["messages"], max_tokens=max_tokens, temperature=temperature):
+            pieces.append(chunk)
+            yield chunk
+        full = "".join(pieces)
+        completion = Completion(text=full, provider=self.provider.name, model=self.provider.model, input_tokens=len(ctx["prompt"].system + ctx["prompt"].user) // 4, output_tokens=len(full) // 4, latency_s=time.time() - t0)
+        ctx["log"](f"{completion.provider}/{completion.model} streamed {len(full)} chars in {completion.latency_s:.1f}s")
+        yield self._finish(ctx, completion, session=session, save_artifact=save_artifact)
 
     def run_all_steps(self, text: str, *, session: Session | None = None, on_step: Callable[[RunResult], bool | None] | None = None, **kw) -> list[RunResult]:
         """Execute a command one step at a time (pausing at checkpoints).
