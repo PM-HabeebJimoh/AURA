@@ -67,11 +67,13 @@ def test_arena_requires_key():
         ArenaProvider()
 
 
-def test_arena_defaults_and_env(monkeypatch):
+def test_arena_requires_base_url_and_reads_env(monkeypatch):
     monkeypatch.setenv("ARENA_API_KEY", "k")
-    a = ArenaProvider()
-    assert a.base_url == "https://api.arena.ai/v1" and a.model == "claude-sonnet-4-5" and a.api_format == "auto" and a.formats == ["openai", "anthropic"]
+    with pytest.raises(ProviderError, match="ARENA_BASE_URL"):
+        ArenaProvider()  # arena.ai publishes no public model endpoint → no silent default host
     monkeypatch.setenv("ARENA_BASE_URL", "https://gw.example.com/v1/")
+    a = ArenaProvider()
+    assert a.base_url == "https://gw.example.com/v1" and a.model == "claude-sonnet-4-5" and a.api_format == "auto" and a.formats == ["openai", "anthropic"]
     monkeypatch.setenv("ARENA_MODEL", "gpt-4o-mini")
     monkeypatch.setenv("ARENA_API_FORMAT", "anthropic")
     monkeypatch.setenv("ARENA_AUTH_HEADER", "x-api-key")
@@ -86,6 +88,7 @@ def test_arena_defaults_and_env(monkeypatch):
 
 def test_auto_provider_prefers_arena(monkeypatch):
     monkeypatch.setenv("ARENA_API_KEY", "k")
+    monkeypatch.setenv("ARENA_BASE_URL", "https://gw.example.com/v1")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "k2")
     assert isinstance(auto_provider(), ArenaProvider)
     assert available_providers()["arena"] is True
@@ -270,7 +273,40 @@ def test_cli_setup_providers_check_and_run(gateway, monkeypatch, capsys, marketp
 
 def test_cli_setup_without_key_non_tty_fails_cleanly(capsys):
     assert main(["setup", "arena"]) == 2
+    assert "--base-url is required" in capsys.readouterr().err
+    assert main(["setup", "arena", "--base-url", "https://x.example/v1"]) == 2
     assert "--key" in capsys.readouterr().err
+    assert main(["setup", "github"]) == 2
+    assert "--key" in capsys.readouterr().err
+
+
+def test_cli_setup_presets_use_openai_compatible_backend(gateway, monkeypatch, capsys, marketplace_path, tmp_path):
+    from pm_engine.providers import PRESETS, OpenAIProvider
+
+    assert set(PRESETS) == {"github", "openrouter", "groq", "gemini"}
+    for name, pr in PRESETS.items():
+        assert pr["base_url"].startswith("https://") and pr["model"] and pr["key_help"]
+    # preset + overridden base URL (pointed at the mock) → OPENAI_* values, provider default 'openai'
+    rc = main(["setup", "github", "--key", KEY, "--base-url", gateway.base_url, "--check"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    saved = config.parse_env_text(config.user_env_file().read_text())
+    assert saved == {"OPENAI_API_KEY": KEY, "OPENAI_BASE_URL": gateway.base_url, "PM_ENGINE_OPENAI_MODEL": PRESETS["github"]["model"], "PM_ENGINE_PROVIDER": "openai"}
+    assert "✓ openai: reachable" in out and "models:" in out and KEY not in out
+    for k in saved:
+        monkeypatch.delenv(k, raising=False)
+    config._loaded.clear()
+    prov = auto_provider()
+    assert isinstance(prov, OpenAIProvider) and prov.base_url == gateway.base_url and prov.model == "openai/gpt-4o-mini"
+    assert main(["-m", str(marketplace_path), "--no-extra", "run", "/write-prd", "SSO", "--json", "-q", "--out", str(tmp_path / "a")]) == 0
+    r = json.loads(capsys.readouterr().out)
+    assert r["completion"]["provider"] == "openai" and "mock openai/gpt-4o-mini" in r["text"]
+    # without --base-url the preset's real endpoint is written
+    config.user_env_file().unlink()
+    assert main(["setup", "groq", "--key", "gsk_test"]) == 0
+    capsys.readouterr()
+    saved = config.parse_env_text(config.user_env_file().read_text())
+    assert saved["OPENAI_BASE_URL"] == "https://api.groq.com/openai/v1" and saved["PM_ENGINE_OPENAI_MODEL"] == "llama-3.3-70b-versatile"
 
 
 def test_providers_check_reports_unreachable_endpoint(monkeypatch, capsys):

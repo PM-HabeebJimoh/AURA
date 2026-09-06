@@ -16,7 +16,7 @@
     pm-engine sessions [--delete ID]
     pm-engine new marketplace|plugin|skill|command <name> [--root DIR] [--plugin P] [--skill S ...]
     pm-engine doctor                                  # environment + marketplace health check
-    pm-engine setup arena [--key K] [--base-url U] [--model M] [--check]   # store credentials in ~/.aura/pm-engine.env
+    pm-engine setup github|openrouter|groq|gemini|arena|anthropic|openai [--key K] [--base-url U] [--model M] [--check]
     pm-engine providers [--check]                     # configured backends (+ live connectivity test)
 """
 
@@ -34,7 +34,7 @@ from . import __version__
 from .export import export
 from .prompt import Attachment
 from .config import load_env_files, loaded_env_files, redact, save_env_values, user_env_file
-from .providers import ArenaProvider, ProviderError, auto_provider, available_providers, make_provider
+from .providers import PRESETS, ArenaProvider, ProviderError, auto_provider, available_providers, make_provider
 from .registry import Registry, RegistryError, default_extra_paths
 from .runner import Engine
 from .scaffold import ScaffoldError, new_command, new_marketplace, new_plugin, new_skill
@@ -412,9 +412,19 @@ def cmd_providers(args) -> int:
             if hasattr(prov, "check"):
                 res = prov.check()
             else:
+                res = {}
                 with no_retries():
+                    if hasattr(prov, "list_models"):
+                        try:
+                            ids = prov.list_models()
+                            res["models"] = len(ids)
+                            res["model_ids"] = ids[:8]
+                            if ids and prov.model not in ids:
+                                res["warning"] = f"model '{prov.model}' not in the endpoint's model list — pick one with `pm-engine setup … --model <id>`"
+                        except ProviderError:
+                            pass  # many gateways don't expose /models; the ping below is the real test
                     c = prov.complete("Reply with the single word OK.", [{"role": "user", "content": "ping"}], max_tokens=8, temperature=0)
-                res = {"ok": True, "model": c.model, "reply": c.text.strip()[:40], "latency_s": round(c.latency_s, 2)}
+                res.update(ok=True, model=c.model, reply=c.text.strip()[:40], latency_s=round(c.latency_s, 2), base_url=getattr(prov, "base_url", None))
         except ProviderError as e:
             res = {"ok": False, "error": str(e)[:300], "status": e.status}
         out["checks"][name] = res
@@ -432,6 +442,8 @@ def cmd_providers(args) -> int:
                 print(f"  ✗ {name}: {res.get('error')}")
             if res.get("warning"):
                 print(f"    ⚠ {res['warning']}")
+            if res.get("model_ids"):
+                print(f"    models: {', '.join(res['model_ids'])}{' …' if res.get('models', 0) > len(res['model_ids']) else ''}")
     return 0 if ok else 1
 
 
@@ -439,16 +451,24 @@ def cmd_setup(args) -> int:
     """Store provider credentials in the user-level env file and (optionally) test them."""
     import getpass
 
+    def ask_key(label: str) -> str | None:
+        if args.key:
+            return args.key
+        if not sys.stdin.isatty():
+            print("error: pass --key (stdin is not a terminal)", file=sys.stderr)
+            return None
+        return getpass.getpass(f"{label} (input hidden): ").strip() or None
+
     values: dict[str, str] = {}
+    default_provider = args.provider
     if args.provider == "arena":
-        key = args.key or os.environ.get("ARENA_API_KEY_NEW") or ""
+        if not args.base_url and not os.environ.get("ARENA_BASE_URL"):
+            print("error: --base-url is required for arena — arena.ai publishes no public model API endpoint, so there is no default.", file=sys.stderr)
+            print("       If you have Arena API access, pass the API root from its docs (e.g. --base-url https://<host>/v1).", file=sys.stderr)
+            print("       No key at all? `pm-engine setup github --key <PAT>` uses GitHub Models, free with your GitHub account.", file=sys.stderr)
+            return 2
+        key = ask_key("Arena API key")
         if not key:
-            if not sys.stdin.isatty():
-                print("error: pass --key (stdin is not a terminal)", file=sys.stderr)
-                return 2
-            key = getpass.getpass("Arena API key (input hidden): ").strip()
-        if not key:
-            print("error: empty key", file=sys.stderr)
             return 2
         values["ARENA_API_KEY"] = key
         if args.base_url:
@@ -459,35 +479,40 @@ def cmd_setup(args) -> int:
             values["ARENA_API_FORMAT"] = args.api_format
         if args.auth_header:
             values["ARENA_AUTH_HEADER"] = args.auth_header
-        if not args.no_default:
-            values["PM_ENGINE_PROVIDER"] = "arena"
-    else:  # anthropic | openai
-        key = args.key or ""
+    elif args.provider in PRESETS:
+        preset = PRESETS[args.provider]
+        key = ask_key(f"{preset['label']} key  [{preset['key_help']}]")
         if not key:
-            if not sys.stdin.isatty():
-                print("error: pass --key (stdin is not a terminal)", file=sys.stderr)
-                return 2
-            key = getpass.getpass(f"{args.provider} API key (input hidden): ").strip()
+            return 2
+        values["OPENAI_API_KEY"] = key
+        values["OPENAI_BASE_URL"] = (args.base_url or preset["base_url"]).rstrip("/")
+        values["PM_ENGINE_OPENAI_MODEL"] = args.model or preset["model"]
+        default_provider = "openai"
+    else:  # anthropic | openai
+        key = ask_key(f"{args.provider} API key")
+        if not key:
+            return 2
         values[{"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}[args.provider]] = key
         if args.base_url:
             values[{"anthropic": "ANTHROPIC_BASE_URL", "openai": "OPENAI_BASE_URL"}[args.provider]] = args.base_url.rstrip("/")
         if args.model:
             values[{"anthropic": "PM_ENGINE_ANTHROPIC_MODEL", "openai": "PM_ENGINE_OPENAI_MODEL"}[args.provider]] = args.model
-        if not args.no_default:
-            values["PM_ENGINE_PROVIDER"] = args.provider
+    if not args.no_default:
+        values["PM_ENGINE_PROVIDER"] = default_provider
     path = save_env_values(values, Path(args.env_file) if args.env_file else None)
-    print(f"saved {', '.join(k for k in values)} → {path}  (mode 0600; not tracked by git)")
-    for k in values:
-        if k.endswith("_KEY"):
-            print(f"  {k} = {redact(values[k])}")
+    print(f"saved {', '.join(values)} → {path}  (mode 0600; not tracked by git)")
+    for k, v in values.items():
+        print(f"  {k} = {redact(v) if k.endswith('_KEY') else v}")
     if args.check:
         print("checking connectivity…")
+
         class _A:  # minimal namespace for cmd_providers
             check = True
             json = False
             model = None
+
         return cmd_providers(_A())
-    print("next: `pm-engine providers --check`  then  `pm-engine run \"/write-prd …\" --stream`")
+    print('next: `pm-engine providers --check`  then  `pm-engine run "/write-prd …" --stream`')
     return 0
 
 
@@ -575,7 +600,7 @@ def cmd_doctor(args) -> int:
     if files:
         print(f"  ✓ env files: {', '.join(str(f) for f in files)}")
     else:
-        print(f"  · env files: none found (create one with `pm-engine setup arena` → {user_env_file()})")
+        print(f"  · env files: none found (create one with `pm-engine setup github --key <PAT>` → {user_env_file()})")
     try:
         active = auto_provider()
     except ProviderError as e:
@@ -583,7 +608,9 @@ def cmd_doctor(args) -> int:
         print(f"  ✗ provider configuration: {e}")
         active = None
     if active is not None:
-        print(f"  ✓ active provider: {active.name}/{active.model}" + ("  (offline scaffolds — run `pm-engine setup arena` or set ARENA_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY / OLLAMA_HOST for model output)" if active.name == "offline" else ""))
+        print(f"  ✓ active provider: {active.name}/{active.model}" + ("  (offline scaffolds — `pm-engine setup github --key <PAT>` for a free backend, or set ARENA_/ANTHROPIC_/OPENAI_ keys)" if active.name == "offline" else ""))
+        if active.name == "openai":
+            print(f"    base url {getattr(active, 'base_url', '?')} · key {redact(getattr(active, 'api_key', None))}")
         if isinstance(active, ArenaProvider):
             print(f"    base url {active.base_url} · format {active.api_format} · key {redact(active.api_key)}")
             if getattr(args, "check", False):
@@ -701,10 +728,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_providers)
 
-    s = sub.add_parser("setup", help="store an API key / endpoint for a provider (arena, anthropic, openai)")
-    s.add_argument("provider", choices=["arena", "anthropic", "openai"])
-    s.add_argument("--key", help="API key (omit to be prompted without echo)")
-    s.add_argument("--base-url", help="API base URL (arena default: https://api.arena.ai/v1)")
+    s = sub.add_parser("setup", help="store an API key / endpoint for a provider: github (free) | openrouter | groq | gemini | arena | anthropic | openai")
+    s.add_argument("provider", choices=["github", "openrouter", "groq", "gemini", "arena", "anthropic", "openai"])
+    s.add_argument("--key", help="API key / token (omit to be prompted without echo)")
+    s.add_argument("--base-url", help="API base URL (required for arena; presets have sane defaults)")
     s.add_argument("--model", help="default model id")
     s.add_argument("--api-format", choices=["auto", "openai", "anthropic"], help="arena wire format (default auto-detect)")
     s.add_argument("--auth-header", help="arena auth header: bearer (default) | x-api-key | <custom header name>")

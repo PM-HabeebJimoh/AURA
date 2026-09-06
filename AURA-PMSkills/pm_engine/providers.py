@@ -42,7 +42,39 @@ DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-5"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 DEFAULT_OLLAMA_MODEL = "llama3.1"
 DEFAULT_ARENA_MODEL = "claude-sonnet-4-5"
-DEFAULT_ARENA_BASE_URL = "https://api.arena.ai/v1"
+
+# Free / OpenAI-compatible gateways that `pm-engine setup <name>` knows how to configure.
+# Each is used through OpenAIProvider (Authorization: Bearer <key>, POST {base}/chat/completions).
+PRESETS: dict[str, dict] = {
+    "github": {
+        "label": "GitHub Models (free for every GitHub account)",
+        "base_url": "https://models.github.ai/inference",
+        "model": "openai/gpt-4o-mini",
+        "key_help": "github.com/settings/personal-access-tokens → Generate new token (fine-grained) → Account permissions → Models: Read-only",
+        "env_key": "GITHUB_MODELS_TOKEN",
+    },
+    "openrouter": {
+        "label": "OpenRouter (free models end in ':free')",
+        "base_url": "https://openrouter.ai/api/v1",
+        "model": "openai/gpt-oss-120b:free",
+        "key_help": "openrouter.ai/keys → Create key",
+        "env_key": "OPENROUTER_API_KEY",
+    },
+    "groq": {
+        "label": "Groq (free tier)",
+        "base_url": "https://api.groq.com/openai/v1",
+        "model": "llama-3.3-70b-versatile",
+        "key_help": "console.groq.com/keys → Create API key",
+        "env_key": "GROQ_API_KEY",
+    },
+    "gemini": {
+        "label": "Google AI Studio / Gemini (free tier, OpenAI-compatible endpoint)",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "model": "gemini-2.5-flash",
+        "key_help": "aistudio.google.com/apikey → Create API key",
+        "env_key": "GEMINI_API_KEY",
+    },
+}
 
 
 def _env(*names: str, default: str | None = None) -> str | None:
@@ -297,7 +329,8 @@ class ArenaProvider:
     Configuration (environment or ``.env``):
 
     * ``ARENA_API_KEY``     — required
-    * ``ARENA_BASE_URL``    — API root (default ``https://api.arena.ai/v1``)
+    * ``ARENA_BASE_URL``    — required: the API root shown in your Arena API documentation / dashboard
+      (arena.ai publishes no public model API at the time of writing, so there is no safe default)
     * ``ARENA_MODEL``       — model id (default ``claude-sonnet-4-5``)
     * ``ARENA_API_FORMAT``  — ``openai`` | ``anthropic`` | ``auto`` (default ``auto``)
     * ``ARENA_AUTH_HEADER`` — ``bearer`` (``Authorization: Bearer``), ``x-api-key``, or any header name
@@ -317,8 +350,11 @@ class ArenaProvider:
     def __init__(self, api_key: str | None = None, model: str | None = None, base_url: str | None = None, api_format: str | None = None, auth_header: str | None = None):
         self.api_key = api_key or os.environ.get("ARENA_API_KEY")
         if not self.api_key:
-            raise ProviderError("ARENA_API_KEY is not set (put it in the environment, ./.env, or ~/.aura/pm-engine.env)")
-        self.base_url = (base_url or _env("ARENA_BASE_URL", "ARENA_API_URL", default=DEFAULT_ARENA_BASE_URL) or DEFAULT_ARENA_BASE_URL).rstrip("/")
+            raise ProviderError("ARENA_API_KEY is not set (put it in the environment, ./.env, or ~/.aura/pm-engine.env; no key → `pm-engine setup github --key <PAT>` for a free backend)")
+        base = base_url or _env("ARENA_BASE_URL", "ARENA_API_URL")
+        if not base:
+            raise ProviderError("ARENA_BASE_URL is not set — Arena.ai has no public model API endpoint to default to; set it to the API root from your Arena API access (e.g. https://<host>/v1), or use a free backend: `pm-engine setup github --key <PAT>`")
+        self.base_url = base.rstrip("/")
         self.model = model or _env("ARENA_MODEL", "PM_ENGINE_ARENA_MODEL", default=DEFAULT_ARENA_MODEL) or DEFAULT_ARENA_MODEL
         fmt = (api_format or _env("ARENA_API_FORMAT", default="auto") or "auto").lower()
         if fmt not in ("auto", "openai", "anthropic"):

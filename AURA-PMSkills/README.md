@@ -12,7 +12,7 @@ AURA-PMSkills/
 ├── aura-skills/        ← AURA's own marketplace (same spec) — merged on top of pm-skills automatically
 │   └── aura-architecture/   (3 skills + `/design-brief` workflow: floor-plan brief → design score → cost check)
 ├── pm_engine/          ← the engine (pure Python, stdlib core)
-├── tests/              ← engine test-suite (163 tests; includes a mock LLM gateway for the Arena path)
+├── tests/              ← engine test-suite (164 tests; includes a mock LLM gateway for the provider paths)
 └── pyproject.toml      ← `pip install -e .` → `pm-engine` CLI
 ```
 
@@ -47,35 +47,42 @@ pm-engine --version
 
 ### Connect a model backend
 
-Without a key the engine runs fully offline (deterministic template scaffolds). To get real model output, connect **Arena.ai** — or any of the other backends:
+Without a key the engine runs fully offline (deterministic template scaffolds). One command connects a real model; the key is stored in `~/.aura/pm-engine.env` (mode 0600, git-ignored), becomes the default, and is tested immediately:
 
 ```bash
-# Arena.ai — one command: stores the key in ~/.aura/pm-engine.env (0600, git-ignored), makes it the default, tests it
-pm-engine setup arena --key <YOUR_ARENA_API_KEY> --check
-#   options: --base-url https://…/v1   --model <id>   --api-format auto|openai|anthropic   --auth-header bearer|x-api-key
-#   (omit --key to be prompted without echo)
+# Free with any GitHub account — create a fine-grained PAT with "Models: Read-only" at
+# https://github.com/settings/personal-access-tokens, then:
+pm-engine setup github --key github_pat_… --check
+#   → "✓ openai: reachable — model openai/gpt-4o-mini … models: openai/gpt-4.1, openai/gpt-4o, …"
+#   pick a different model any time:  pm-engine setup github --key … --model openai/gpt-4.1
 
-pm-engine providers --check      # one tiny request per configured backend → "✓ arena: reachable — model …"
-pm-engine doctor --check         # full health check incl. the live provider round-trip
+# other presets (all OpenAI-compatible, free tiers):  openrouter · groq · gemini
+pm-engine setup groq --key gsk_… --check
+
+# Arena.ai — only if you have Arena *API* access (see note below); both key and base URL are required
+pm-engine setup arena --key <ARENA_API_KEY> --base-url https://<host-from-your-arena-docs>/v1 --check
+
+pm-engine providers --check       # one tiny request per configured backend, lists the endpoint's model ids
+pm-engine doctor --check          # full health check incl. the live provider round-trip
 pm-engine run "/write-prd SSO for enterprise" --stream
 ```
+
+> **About arena.ai.** An arena.ai *account* (the model-comparison site) does not come with an API key: as of September 2026 Arena publishes no public developer API for text generation, and the engine therefore has **no default Arena endpoint** — `pm-engine setup arena` refuses to guess a host. The `arena` provider exists so that, if you obtain Arena API access (or any gateway that fronts Arena's models), you can point the engine at it: it speaks both OpenAI (`/chat/completions`) and Anthropic (`/messages`) wire formats and auto-detects which one the endpoint accepts.
 
 Or configure through the environment / a `.env` file (see [`.env.example`](.env.example); real env vars always win, then `./.env`, then `~/.aura/pm-engine.env`):
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `ARENA_API_KEY` | Arena.ai key — when set, Arena is selected automatically | — |
-| `ARENA_BASE_URL` | API root of the Arena model endpoint | `https://api.arena.ai/v1` |
-| `ARENA_MODEL` | model id to request | `claude-sonnet-4-5` |
-| `ARENA_API_FORMAT` | wire format: `auto` (try OpenAI `chat/completions`, fall back to Anthropic `messages`) · `openai` · `anthropic` | `auto` |
-| `ARENA_AUTH_HEADER` | `bearer` (`Authorization: Bearer`) · `x-api-key` · any header name | `bearer` |
-| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` (+`OPENAI_BASE_URL`) / `OLLAMA_HOST` | other backends | — |
+| `OPENAI_API_KEY` + `OPENAI_BASE_URL` | any OpenAI-compatible gateway: GitHub Models `https://models.github.ai/inference`, OpenRouter `https://openrouter.ai/api/v1`, Groq `https://api.groq.com/openai/v1`, Gemini `https://generativelanguage.googleapis.com/v1beta/openai`, vLLM, LM Studio… | `https://api.openai.com/v1` |
+| `PM_ENGINE_OPENAI_MODEL` | model id for that gateway | `gpt-4o-mini` |
+| `ARENA_API_KEY` + `ARENA_BASE_URL` | Arena.ai API access (both required); `ARENA_MODEL`, `ARENA_API_FORMAT` (`auto`/`openai`/`anthropic`), `ARENA_AUTH_HEADER` (`bearer`/`x-api-key`/custom) | — / `claude-sonnet-4-5` / `auto` / `bearer` |
+| `ANTHROPIC_API_KEY` / `OLLAMA_HOST` | other backends | — |
 | `PM_ENGINE_PROVIDER` | force `arena` · `anthropic` · `openai` · `ollama` · `offline` | auto |
 | `PM_ENGINE_MAX_RETRIES` | retries with back-off on 429/5xx/529 and network errors | `3` |
 
 Selection order when nothing is forced: `ARENA_API_KEY` → `ANTHROPIC_API_KEY` → `OPENAI_API_KEY` → `OLLAMA_HOST` → offline. Keys are never written to logs, sessions, artifacts or API responses (`/api/providers` only reports the base URL, model and a redacted check result).
 
-**Offline sandbox?** `python -m tests.mock_gateway --port 9001` starts a local stand-in that speaks both wire formats (`pm-engine setup arena --key test-arena-key --base-url http://127.0.0.1:9001/v1 --check`) — the same server the test-suite uses to prove the Arena path end-to-end.
+**Offline sandbox?** `python -m tests.mock_gateway --port 9001` starts a local stand-in that speaks both wire formats (`pm-engine setup github --key test-arena-key --base-url http://127.0.0.1:9001/v1 --check`) — the same server the test-suite uses to prove the provider path end-to-end.
 
 ## Use
 
@@ -105,7 +112,7 @@ pm-engine export cursor .           # → .cursor/skills/*  (also: claude gemini
 pm-engine validate -v               # upstream spec + engine checks → exit 1 on errors
 pm-engine test                      # upstream validator + upstream unittest suite + engine pytest suite
 pm-engine doctor [--check]          # environment, roots, counts, validation, provider (+ live round-trip), sessions
-pm-engine setup arena --key … --check   # store + verify Arena.ai credentials (also: setup anthropic|openai)
+pm-engine setup github --key … --check  # connect a free model backend (also: openrouter|groq|gemini|arena|anthropic|openai)
 pm-engine providers [--check]       # which backends are configured (+ one tiny request each)
 pm-engine update-skills             # re-vendor upstream main (updates pm-skills/UPSTREAM)
 
@@ -152,7 +159,7 @@ cd AURA-PMSkills
 (cd pm-skills && python validate_plugins.py && python -m unittest discover -s tests)   # upstream: 110 components, 15 tests
 python pm-skills/validate_plugins.py aura-skills                                       # upstream validator on AURA's plugin: PASS
 pm-engine validate -v                                                                  # both roots: 10 plugins · 71 skills · 43 commands, 0 errors, 0 warnings
-python -m pytest tests -q                                                              # 163 passed (Arena path exercised against the mock gateway)
+python -m pytest tests -q                                                              # 164 passed (provider paths exercised against the mock gateway)
 pm-engine doctor                                                                       # "doctor: all good"
 ```
 
