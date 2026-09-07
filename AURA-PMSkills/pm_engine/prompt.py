@@ -58,6 +58,14 @@ class Attachment:
     def render(self) -> str:
         return f'<attachment name="{self.name}" kind="{self.kind}">\n{self.text}\n</attachment>'
 
+    def truncated(self, max_chars: int) -> "Attachment":
+        """A copy cut to *max_chars* with a visible marker (used to honour a context budget)."""
+        if len(self.text) <= max_chars:
+            return self
+        keep = max(0, max_chars)
+        marker = f"\n\n[... truncated {len(self.text) - keep} characters to fit the model's context budget ...]"
+        return Attachment(name=self.name, text=self.text[:keep] + marker, kind=self.kind)
+
 
 @dataclass
 class Prompt:
@@ -70,7 +78,7 @@ class Prompt:
 
     @property
     def approx_tokens(self) -> int:
-        return (len(self.system) + len(self.user)) // 4
+        return estimate_tokens(self.system) + estimate_tokens(self.user)
 
     def to_dict(self) -> dict:
         return {
@@ -82,6 +90,14 @@ class Prompt:
             "approx_tokens": self.approx_tokens,
             "metadata": self.metadata,
         }
+
+
+CHARS_PER_TOKEN = 3.5  # deliberately conservative: markdown/tables tokenize denser than prose (~4 chars/token)
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough, slightly pessimistic token count — good enough to budget a request without a tokenizer."""
+    return -(-len(text) * 2 // 7)  # ceil(len / 3.5)
 
 
 def substitute_arguments(text: str, arguments: str) -> str:
@@ -131,10 +147,22 @@ class PromptBuilder:
         extra_skills: Sequence[Skill] = (),
         step: int | None = None,
         history: Sequence[dict] = (),
+        lean: bool = False,
     ) -> Prompt:
+        """Build the prompt for a command run.
+
+        Skills are loaded lazily, like Claude Code does: a mode loads only its own
+        skills, and a step-wise run (``step``) loads the skills introduced up to that
+        step. ``lean=True`` loads only the skills the current step itself applies —
+        the engine falls back to it when a context budget is tight.
+        """
         wf = parse_workflow(command)
         mode, remaining = resolve_mode(wf, arguments)
-        skills = self.registry.resolve_command_skills(command)
+        all_skills = self.registry.resolve_command_skills(command)
+        wanted = set(wf.skills_at(mode, step) if lean and step is not None else wf.skills_up_to(mode, step))
+        # skills the workflow parser never saw (unusual phrasing) are kept rather than silently dropped
+        skills = [s for s in all_skills if s.name in wanted or s.name not in wf.skills]
+        scope = ("step-lean" if lean else "step") if step is not None else ("mode" if mode and len(skills) < len(all_skills) else "all")
         for s in extra_skills:
             if s not in skills:
                 skills.append(s)
@@ -152,7 +180,7 @@ class PromptBuilder:
                     "Complete only this step, then stop and (if the step has a checkpoint) ask the checkpoint question."
                 )
         user = self._user_block(remaining or arguments, attachments, command=command, mode=mode)
-        return Prompt(system=system, user=user, skills=skills, command=command, mode=mode, metadata={"step": step, "workflow_steps": len(wf.steps_for(mode))})
+        return Prompt(system=system, user=user, skills=skills, command=command, mode=mode, metadata={"step": step, "workflow_steps": len(wf.steps_for(mode)), "skills_scope": scope, "command_skills": len(all_skills)})
 
     def for_free_text(self, request: str, auto_skills: Sequence[Skill], attachments: Iterable[Attachment] = ()) -> Prompt:
         if auto_skills:

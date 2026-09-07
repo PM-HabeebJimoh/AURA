@@ -12,7 +12,7 @@
 cd AURA-PMSkills
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-pm-engine setup github --key <GITHUB_PAT_WITH_MODELS_READ> --check   # free model backend (GitHub Models); skip → offline scaffolds
+pm-engine setup openrouter --key <OPENROUTER_KEY> --check   # free model backend (also gemini|groq); skip → offline scaffolds
 
 pm-engine list                                        # 10 plugins · 71 skills · 43 commands (pm-skills + aura-skills)
 pm-engine run "/write-prd SSO support for enterprise" # runs a chained PM workflow

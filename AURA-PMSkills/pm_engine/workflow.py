@@ -94,10 +94,64 @@ class Workflow:
     skills: list[str]
     sections: dict[str, str]
     _mode_sections: dict[str, str] = field(default_factory=dict, repr=False)
+    _shared_skills: list[str] = field(default_factory=list, repr=False)
 
     @property
     def has_modes(self) -> bool:
         return bool(self.modes)
+
+    def skills_for(self, mode: str | None) -> list[str]:
+        """Skills relevant to a run: with a matched mode, only that mode's skills plus the shared ones.
+
+        ``/sprint retro`` therefore loads ``retro`` — not ``sprint-plan`` and ``release-notes`` too.
+        A template-only mode (``/business-model all``) keeps every skill.
+        """
+        key = self.match_mode(mode)
+        if key is None:
+            return list(self.skills)
+        own = _skills_in(self._mode_sections.get(key, ""))
+        if not own:
+            return list(self.skills)
+        wanted = set(own) | set(self._shared_skills)
+        return [n for n in self.skills if n in wanted]
+
+    def skills_up_to(self, mode: str | None, step: int | None) -> list[str]:
+        """Skills a step-wise run needs at *step* (1-based).
+
+        Mirrors Claude Code's lazy loading: a skill enters the context when the
+        workflow first says "apply the **x** skill" and stays for later steps, so
+        step 1 ("gather context") of most commands loads none. Skills referenced
+        outside the numbered steps (a Scope section, a mode template) are always in play.
+        """
+        allowed = self.skills_for(mode)
+        steps = self.steps_for(mode)
+        if step is None or not steps:
+            return allowed
+        in_steps = {n for st in steps for n in st.skills}
+        active = {n for st in steps[: max(step, 0)] for n in st.skills}
+        # skills mentioned outside the numbered steps join at the first step that actually does work
+        first_work = next((i for i, st in enumerate(steps, 1) if st.skills or not st.is_context_gathering), 1)
+        outside_ok = step >= first_work
+        return [n for n in allowed if n in active or (n not in in_steps and outside_ok)]
+
+    def skills_at(self, mode: str | None, step: int | None) -> list[str]:
+        """Lean variant of :meth:`skills_up_to`: only what *step* itself applies.
+
+        Earlier steps' results already sit in the session history, so their skill
+        instructions can be left out when context is tight: a "Synthesize" or
+        "Generate report" step that names no skill gets none of the step-introduced
+        ones (the command body carries the output template). Skills referenced
+        outside the numbered steps stay in play for every working step;
+        context-gathering and next-steps steps load nothing.
+        """
+        allowed = self.skills_for(mode)
+        steps = self.steps_for(mode)
+        if step is None or not steps or not (1 <= step <= len(steps)):
+            return allowed
+        st = steps[step - 1]
+        in_steps = {n for x in steps for n in x.skills}
+        working = bool(st.skills) or not (st.is_context_gathering or st.is_next_steps)
+        return [n for n in allowed if n in st.skills or (n not in in_steps and working)]
 
     @property
     def checkpoints(self) -> list[str]:
@@ -352,6 +406,10 @@ def parse_workflow(command: Command) -> Workflow:
     for name in _skills_in(body):  # references outside numbered steps (e.g. in Scope)
         if name not in skills:
             skills.append(name)
+    shared_text = body
+    for raw in mode_sections.values():
+        shared_text = shared_text.replace(raw, "")
+    shared_skills = _skills_in(shared_text)
 
     return Workflow(
         command=command,
@@ -365,6 +423,7 @@ def parse_workflow(command: Command) -> Workflow:
         skills=skills,
         sections=sections,
         _mode_sections=mode_sections,
+        _shared_skills=shared_skills,
     )
 
 

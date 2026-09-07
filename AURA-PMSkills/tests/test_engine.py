@@ -98,8 +98,9 @@ def test_step_out_of_range(engine):
 def test_mode_command_run(engine):
     r = engine.run("/sprint retro The last sprint shipped late")
     assert r.mode == "retro" and r.total_steps == 3
-    assert [s.name for s in r.skills] == ["sprint-plan", "retro", "release-notes"]
-    assert 'mode="retro"' in r.prompt.system
+    assert [s.name for s in r.skills] == ["retro"]  # only the chosen mode's skill is loaded
+    assert 'mode="retro"' in r.prompt.system and '<skill name="pm-execution:sprint-plan">' not in r.prompt.system
+    assert r.prompt.metadata["skills_scope"] == "mode" and r.prompt.metadata["command_skills"] == 3
 
 
 def test_session_persistence_roundtrip(engine, tmp_path):

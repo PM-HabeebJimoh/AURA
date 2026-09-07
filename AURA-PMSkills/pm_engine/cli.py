@@ -16,7 +16,7 @@
     pm-engine sessions [--delete ID]
     pm-engine new marketplace|plugin|skill|command <name> [--root DIR] [--plugin P] [--skill S ...]
     pm-engine doctor                                  # environment + marketplace health check
-    pm-engine setup github|openrouter|groq|gemini|arena|anthropic|openai [--key K] [--base-url U] [--model M] [--check]
+    pm-engine setup openrouter|gemini|groq|arena|anthropic|openai [--key K] [--base-url U] [--model M] [--check]
     pm-engine providers [--check]                     # configured backends (+ live connectivity test)
 """
 
@@ -34,7 +34,7 @@ from . import __version__
 from .export import export
 from .prompt import Attachment
 from .config import load_env_files, loaded_env_files, redact, save_env_values, user_env_file
-from .providers import PRESETS, ArenaProvider, ProviderError, auto_provider, available_providers, make_provider
+from .providers import PRESETS, RETIRED_PRESETS, ArenaProvider, OfflineProvider, ProviderError, auto_provider, available_providers, make_provider
 from .registry import Registry, RegistryError, default_extra_paths
 from .runner import Engine
 from .scaffold import ScaffoldError, new_command, new_marketplace, new_plugin, new_skill
@@ -461,11 +461,14 @@ def cmd_setup(args) -> int:
 
     values: dict[str, str] = {}
     default_provider = args.provider
+    if args.provider in RETIRED_PRESETS:
+        print(f"error: {RETIRED_PRESETS[args.provider]}", file=sys.stderr)
+        return 2
     if args.provider == "arena":
         if not args.base_url and not os.environ.get("ARENA_BASE_URL"):
             print("error: --base-url is required for arena — arena.ai publishes no public model API endpoint, so there is no default.", file=sys.stderr)
             print("       If you have Arena API access, pass the API root from its docs (e.g. --base-url https://<host>/v1).", file=sys.stderr)
-            print("       No key at all? `pm-engine setup github --key <PAT>` uses GitHub Models, free with your GitHub account.", file=sys.stderr)
+            print("       No key at all? `pm-engine setup openrouter --key <key>` uses OpenRouter's free models (sign-up only, no card).", file=sys.stderr)
             return 2
         key = ask_key("Arena API key")
         if not key:
@@ -488,6 +491,15 @@ def cmd_setup(args) -> int:
         values["OPENAI_BASE_URL"] = (args.base_url or preset["base_url"]).rstrip("/")
         values["PM_ENGINE_OPENAI_MODEL"] = args.model or preset["model"]
         default_provider = "openai"
+        budget = preset.get("budget")
+        if args.max_input_tokens is not None:
+            values["PM_ENGINE_MAX_INPUT_TOKENS"] = str(args.max_input_tokens)
+        elif budget:
+            values["PM_ENGINE_MAX_INPUT_TOKENS"] = str(budget["input"])
+        if args.max_output_tokens is not None:
+            values["PM_ENGINE_MAX_OUTPUT_TOKENS"] = str(args.max_output_tokens)
+        elif budget:
+            values["PM_ENGINE_MAX_OUTPUT_TOKENS"] = str(budget["output"])
     else:  # anthropic | openai
         key = ask_key(f"{args.provider} API key")
         if not key:
@@ -497,12 +509,21 @@ def cmd_setup(args) -> int:
             values[{"anthropic": "ANTHROPIC_BASE_URL", "openai": "OPENAI_BASE_URL"}[args.provider]] = args.base_url.rstrip("/")
         if args.model:
             values[{"anthropic": "PM_ENGINE_ANTHROPIC_MODEL", "openai": "PM_ENGINE_OPENAI_MODEL"}[args.provider]] = args.model
+    if args.provider not in PRESETS:
+        if args.max_input_tokens is not None:
+            values["PM_ENGINE_MAX_INPUT_TOKENS"] = str(args.max_input_tokens)
+        if args.max_output_tokens is not None:
+            values["PM_ENGINE_MAX_OUTPUT_TOKENS"] = str(args.max_output_tokens)
     if not args.no_default:
         values["PM_ENGINE_PROVIDER"] = default_provider
     path = save_env_values(values, Path(args.env_file) if args.env_file else None)
     print(f"saved {', '.join(values)} → {path}  (mode 0600; not tracked by git)")
     for k, v in values.items():
         print(f"  {k} = {redact(v) if k.endswith('_KEY') else v}")
+    if values.get("PM_ENGINE_MAX_INPUT_TOKENS"):
+        print(f"  context budget: prompts are trimmed to ≈{values['PM_ENGINE_MAX_INPUT_TOKENS']} input tokens"
+              + (f" and replies capped at {values['PM_ENGINE_MAX_OUTPUT_TOKENS']}" if values.get("PM_ENGINE_MAX_OUTPUT_TOKENS") else "")
+              + " (this backend rejects bigger requests). Big workflows: run them step by step (--all-steps). `pm-engine doctor` lists which ones.")
     if args.check:
         print("checking connectivity…")
 
@@ -600,7 +621,7 @@ def cmd_doctor(args) -> int:
     if files:
         print(f"  ✓ env files: {', '.join(str(f) for f in files)}")
     else:
-        print(f"  · env files: none found (create one with `pm-engine setup github --key <PAT>` → {user_env_file()})")
+        print(f"  · env files: none found (create one with `pm-engine setup openrouter --key <key>` → {user_env_file()})")
     try:
         active = auto_provider()
     except ProviderError as e:
@@ -608,7 +629,7 @@ def cmd_doctor(args) -> int:
         print(f"  ✗ provider configuration: {e}")
         active = None
     if active is not None:
-        print(f"  ✓ active provider: {active.name}/{active.model}" + ("  (offline scaffolds — `pm-engine setup github --key <PAT>` for a free backend, or set ARENA_/ANTHROPIC_/OPENAI_ keys)" if active.name == "offline" else ""))
+        print(f"  ✓ active provider: {active.name}/{active.model}" + ("  (offline scaffolds — `pm-engine setup openrouter --key <key>` for a free backend, or set ARENA_/ANTHROPIC_/OPENAI_ keys)" if active.name == "offline" else ""))
         if active.name == "openai":
             print(f"    base url {getattr(active, 'base_url', '?')} · key {redact(getattr(active, 'api_key', None))}")
         if isinstance(active, ArenaProvider):
@@ -623,6 +644,18 @@ def cmd_doctor(args) -> int:
     for name, configured in prov.items():
         if name != "offline":
             print(f"    {'✓' if configured else '·'} {name}")
+    eng = Engine(reg, active or OfflineProvider())
+    if eng.max_input_tokens:
+        rep = eng.budget_report()
+        print(f"  ✓ context budget: ≈{eng.max_input_tokens} input / {eng.max_output_tokens} output tokens (PM_ENGINE_MAX_INPUT_TOKENS / PM_ENGINE_MAX_OUTPUT_TOKENS)")
+        if rep["over_full"]:
+            print(f"    ⚠ {len(rep['over_full'])} of {rep['commands']} commands exceed it when run in one go — use --all-steps / --step: {', '.join(rep['over_full'])}")
+        if rep["over_step"]:
+            print(f"    ⚠ {len(rep['over_step'])} exceed it even step by step (needs a bigger-context backend for those): {', '.join(rep['over_step'])}")
+        if not rep["over_full"]:
+            print(f"    ✓ every command prompt fits (largest: {rep['largest']['command']} ≈{rep['largest']['full']} tokens)")
+    else:
+        print(f"  · context budget: none (set PM_ENGINE_MAX_INPUT_TOKENS for small-context backends; largest command prompt ≈{eng.budget_report()['largest']['full']} tokens)")
     from .session import sessions_dir
 
     print(f"  ✓ sessions dir: {sessions_dir()} ({len(list(Session.list()))} sessions)")
@@ -680,7 +713,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--session", help="continue a saved session")
     s.add_argument("--save-session", action="store_true")
     s.add_argument("--out", help="directory to save artifacts")
-    s.add_argument("--max-tokens", type=int, default=4096)
+    s.add_argument("--max-tokens", type=int, help="reply cap for this run (default: PM_ENGINE_MAX_OUTPUT_TOKENS or 4096)")
     s.add_argument("--show-prompt", action="store_true")
     s.add_argument("--stream", action="store_true", help="stream the response as it is generated")
     s.add_argument("--json", action="store_true")
@@ -728,11 +761,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_providers)
 
-    s = sub.add_parser("setup", help="store an API key / endpoint for a provider: github (free) | openrouter | groq | gemini | arena | anthropic | openai")
-    s.add_argument("provider", choices=["github", "openrouter", "groq", "gemini", "arena", "anthropic", "openai"])
+    s = sub.add_parser("setup", help="store an API key / endpoint for a provider: openrouter (free) | gemini (free) | groq (free) | arena | anthropic | openai")
+    s.add_argument("provider", choices=["openrouter", "gemini", "groq", "arena", "anthropic", "openai", "github"], metavar="provider", help="openrouter | gemini | groq | arena | anthropic | openai  (github: retired 2026-07-30, explains why)")
     s.add_argument("--key", help="API key / token (omit to be prompted without echo)")
     s.add_argument("--base-url", help="API base URL (required for arena; presets have sane defaults)")
     s.add_argument("--model", help="default model id")
+    s.add_argument("--max-input-tokens", type=int, help="context budget: trim history/attachments so prompts stay under N tokens (PM_ENGINE_MAX_INPUT_TOKENS; presets with per-request caps set one)")
+    s.add_argument("--max-output-tokens", type=int, help="default reply cap (PM_ENGINE_MAX_OUTPUT_TOKENS; default 4096)")
     s.add_argument("--api-format", choices=["auto", "openai", "anthropic"], help="arena wire format (default auto-detect)")
     s.add_argument("--auth-header", help="arena auth header: bearer (default) | x-api-key | <custom header name>")
     s.add_argument("--env-file", help="where to save (default: ~/.aura/pm-engine.env or $PM_ENGINE_HOME/pm-engine.env)")

@@ -89,7 +89,7 @@ def create_app(engine: Engine | None = None) -> Flask:
             active["base_url"] = getattr(engine.provider, "base_url")
         if hasattr(engine.provider, "api_format"):
             active["format"] = getattr(engine.provider, "_resolved", None) or getattr(engine.provider, "api_format")
-        body = {"active": active, "available": available_providers()}
+        body = {"active": active, "available": available_providers(), "budget": engine.budget}
         if request.args.get("check") in ("1", "true", "yes") and engine.provider.name != "offline":
             if hasattr(engine.provider, "check"):
                 body["check"] = engine.provider.check()
@@ -221,7 +221,7 @@ def create_app(engine: Engine | None = None) -> Flask:
             session=session,
             step=int(step) if step else None,
             extra_skills=payload.get("skills") or [],
-            max_tokens=int(payload.get("max_tokens", 4096)),
+            max_tokens=int(payload["max_tokens"]) if payload.get("max_tokens") else None,
             temperature=float(payload.get("temperature", 0.4)),
             save_artifact=bool(payload.get("save_artifact", True)),
         )
@@ -246,7 +246,7 @@ def create_app(engine: Engine | None = None) -> Flask:
                     session=session,
                     step=int(step) if step else None,
                     extra_skills=payload.get("skills") or [],
-                    max_tokens=int(payload.get("max_tokens", 4096)),
+                    max_tokens=int(payload["max_tokens"]) if payload.get("max_tokens") else None,
                     temperature=float(payload.get("temperature", 0.4)),
                     save_artifact=bool(payload.get("save_artifact", True)),
                 )

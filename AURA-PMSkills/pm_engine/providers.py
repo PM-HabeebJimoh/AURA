@@ -45,35 +45,37 @@ DEFAULT_ARENA_MODEL = "claude-sonnet-4-5"
 
 # Free / OpenAI-compatible gateways that `pm-engine setup <name>` knows how to configure.
 # Each is used through OpenAIProvider (Authorization: Bearer <key>, POST {base}/chat/completions).
+# ``budget`` (optional) is written as PM_ENGINE_MAX_INPUT_TOKENS / PM_ENGINE_MAX_OUTPUT_TOKENS so the
+# engine trims context for backends whose free tier caps the *whole request* (Groq: 8K tokens per minute).
 PRESETS: dict[str, dict] = {
-    "github": {
-        "label": "GitHub Models (free for every GitHub account)",
-        "base_url": "https://models.github.ai/inference",
-        "model": "openai/gpt-4o-mini",
-        "key_help": "github.com/settings/personal-access-tokens → Generate new token (fine-grained) → Account permissions → Models: Read-only",
-        "env_key": "GITHUB_MODELS_TOKEN",
-    },
     "openrouter": {
-        "label": "OpenRouter (free models end in ':free')",
+        "label": "OpenRouter (free — 'openrouter/free' routes to whichever free models are up; ids ending in ':free' pin one)",
         "base_url": "https://openrouter.ai/api/v1",
-        "model": "openai/gpt-oss-120b:free",
-        "key_help": "openrouter.ai/keys → Create key",
+        "model": "openrouter/free",
+        "key_help": "openrouter.ai/settings/keys → Create key (sign up with email/GitHub/Google, no card; 20 req/min, 50 req/day on free models)",
         "env_key": "OPENROUTER_API_KEY",
     },
-    "groq": {
-        "label": "Groq (free tier)",
-        "base_url": "https://api.groq.com/openai/v1",
-        "model": "llama-3.3-70b-versatile",
-        "key_help": "console.groq.com/keys → Create API key",
-        "env_key": "GROQ_API_KEY",
-    },
     "gemini": {
-        "label": "Google AI Studio / Gemini (free tier, OpenAI-compatible endpoint)",
+        "label": "Google AI Studio / Gemini (free tier, OpenAI-compatible endpoint, 1M-token context)",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
         "model": "gemini-2.5-flash",
-        "key_help": "aistudio.google.com/apikey → Create API key",
+        "key_help": "aistudio.google.com/apikey → Create API key (free tier; prompts may be used to improve Google products)",
         "env_key": "GEMINI_API_KEY",
     },
+    "groq": {
+        "label": "Groq (free tier — fast, but every request is capped at 8K tokens incl. the reply)",
+        "base_url": "https://api.groq.com/openai/v1",
+        "model": "openai/gpt-oss-120b",
+        "key_help": "console.groq.com/keys → Create API key (free: 30 req/min, 1K req/day, 8K tokens/min for gpt-oss)",
+        "env_key": "GROQ_API_KEY",
+        "budget": {"input": 5000, "output": 2500},  # Groq counts prompt + max_tokens against the 8K/min cap
+    },
+}
+
+# Presets that no longer work, with the reason (kept so `pm-engine setup <name>` explains instead of failing obscurely).
+RETIRED_PRESETS: dict[str, str] = {
+    "github": "GitHub Models (models.github.ai) was retired on 2026-07-30 — the playground, catalog and inference API are gone for every account. "
+    "Use `pm-engine setup openrouter --key <key>` (free, no card) or `pm-engine setup gemini --key <key>` instead.",
 }
 
 
@@ -134,6 +136,21 @@ class _StreamMixin:
         yield from iter_chunks(text)
 
 
+_TOO_BIG_MARKERS = ("request too large", "context length", "context_length", "maximum context", "too many tokens", "reduce your message size", "reduce the length", "prompt is too long", "input is too long")
+
+
+def _size_hint(status: int, detail: str) -> str:
+    """Append actionable advice when the backend rejected the request for being too big."""
+    d = detail.lower()
+    if status == 413 or (status in (400, 422, 429) and any(m in d for m in _TOO_BIG_MARKERS)):
+        return (
+            " — the request exceeds this backend's size limit. Set a context budget so the engine trims history/attachments and loads "
+            "skills lazily (e.g. PM_ENGINE_MAX_INPUT_TOKENS=5000 PM_ENGINE_MAX_OUTPUT_TOKENS=2500, or `pm-engine setup <preset> --max-input-tokens 5000`), "
+            "run big workflows step by step (--all-steps / --step N), or switch to a larger-context backend (`pm-engine setup gemini|openrouter`)."
+        )
+    return ""
+
+
 def _request(url: str, payload: dict | None, headers: dict, timeout: float, method: str = "POST"):
     body = json.dumps(payload).encode("utf-8") if payload is not None else None
     hdrs = {"Content-Type": "application/json", **headers} if body is not None else dict(headers)
@@ -142,7 +159,7 @@ def _request(url: str, payload: dict | None, headers: dict, timeout: float, meth
         return urllib.request.urlopen(req, timeout=timeout)  # noqa: S310 — https to configured API host
     except urllib.error.HTTPError as e:  # pragma: no cover - network
         detail = e.read().decode("utf-8", errors="replace")[:2000]
-        raise ProviderError(f"HTTP {e.code} from {url}: {detail}", status=e.code) from e
+        raise ProviderError(f"HTTP {e.code} from {url}: {detail}{_size_hint(e.code, detail)}", status=e.code) from e
     except urllib.error.URLError as e:  # pragma: no cover - network
         raise ProviderError(f"network error calling {url}: {e.reason}") from e
 
@@ -350,10 +367,10 @@ class ArenaProvider:
     def __init__(self, api_key: str | None = None, model: str | None = None, base_url: str | None = None, api_format: str | None = None, auth_header: str | None = None):
         self.api_key = api_key or os.environ.get("ARENA_API_KEY")
         if not self.api_key:
-            raise ProviderError("ARENA_API_KEY is not set (put it in the environment, ./.env, or ~/.aura/pm-engine.env; no key → `pm-engine setup github --key <PAT>` for a free backend)")
+            raise ProviderError("ARENA_API_KEY is not set (put it in the environment, ./.env, or ~/.aura/pm-engine.env; no key → `pm-engine setup openrouter --key <key>` for a free backend)")
         base = base_url or _env("ARENA_BASE_URL", "ARENA_API_URL")
         if not base:
-            raise ProviderError("ARENA_BASE_URL is not set — Arena.ai has no public model API endpoint to default to; set it to the API root from your Arena API access (e.g. https://<host>/v1), or use a free backend: `pm-engine setup github --key <PAT>`")
+            raise ProviderError("ARENA_BASE_URL is not set — Arena.ai has no public model API endpoint to default to; set it to the API root from your Arena API access (e.g. https://<host>/v1), or use a free backend: `pm-engine setup openrouter --key <key>`")
         self.base_url = base.rstrip("/")
         self.model = model or _env("ARENA_MODEL", "PM_ENGINE_ARENA_MODEL", default=DEFAULT_ARENA_MODEL) or DEFAULT_ARENA_MODEL
         fmt = (api_format or _env("ARENA_API_FORMAT", default="auto") or "auto").lower()

@@ -276,37 +276,57 @@ def test_cli_setup_without_key_non_tty_fails_cleanly(capsys):
     assert "--base-url is required" in capsys.readouterr().err
     assert main(["setup", "arena", "--base-url", "https://x.example/v1"]) == 2
     assert "--key" in capsys.readouterr().err
-    assert main(["setup", "github"]) == 2
+    assert main(["setup", "openrouter"]) == 2
     assert "--key" in capsys.readouterr().err
 
 
-def test_cli_setup_presets_use_openai_compatible_backend(gateway, monkeypatch, capsys, marketplace_path, tmp_path):
-    from pm_engine.providers import PRESETS, OpenAIProvider
+def test_cli_setup_github_preset_is_retired(capsys):
+    """GitHub Models shut down on 2026-07-30: the command must explain, not write a dead endpoint."""
+    assert main(["setup", "github", "--key", "github_pat_x"]) == 2
+    err = capsys.readouterr().err
+    assert "retired" in err and "openrouter" in err and "github_pat_x" not in err
+    assert not config.user_env_file().exists()
 
-    assert set(PRESETS) == {"github", "openrouter", "groq", "gemini"}
+
+def test_cli_setup_presets_use_openai_compatible_backend(gateway, monkeypatch, capsys, marketplace_path, tmp_path):
+    from pm_engine.providers import PRESETS, RETIRED_PRESETS, OpenAIProvider
+
+    assert set(PRESETS) == {"openrouter", "groq", "gemini"} and "github" in RETIRED_PRESETS
     for name, pr in PRESETS.items():
         assert pr["base_url"].startswith("https://") and pr["model"] and pr["key_help"]
     # preset + overridden base URL (pointed at the mock) → OPENAI_* values, provider default 'openai'
-    rc = main(["setup", "github", "--key", KEY, "--base-url", gateway.base_url, "--check"])
+    rc = main(["setup", "openrouter", "--key", KEY, "--base-url", gateway.base_url, "--check"])
     out = capsys.readouterr().out
     assert rc == 0, out
     saved = config.parse_env_text(config.user_env_file().read_text())
-    assert saved == {"OPENAI_API_KEY": KEY, "OPENAI_BASE_URL": gateway.base_url, "PM_ENGINE_OPENAI_MODEL": PRESETS["github"]["model"], "PM_ENGINE_PROVIDER": "openai"}
+    assert saved == {"OPENAI_API_KEY": KEY, "OPENAI_BASE_URL": gateway.base_url, "PM_ENGINE_OPENAI_MODEL": PRESETS["openrouter"]["model"], "PM_ENGINE_PROVIDER": "openai"}
     assert "✓ openai: reachable" in out and "models:" in out and KEY not in out
     for k in saved:
         monkeypatch.delenv(k, raising=False)
     config._loaded.clear()
     prov = auto_provider()
-    assert isinstance(prov, OpenAIProvider) and prov.base_url == gateway.base_url and prov.model == "openai/gpt-4o-mini"
+    assert isinstance(prov, OpenAIProvider) and prov.base_url == gateway.base_url and prov.model == "openrouter/free"
     assert main(["-m", str(marketplace_path), "--no-extra", "run", "/write-prd", "SSO", "--json", "-q", "--out", str(tmp_path / "a")]) == 0
     r = json.loads(capsys.readouterr().out)
-    assert r["completion"]["provider"] == "openai" and "mock openai/gpt-4o-mini" in r["text"]
-    # without --base-url the preset's real endpoint is written
+    assert r["completion"]["provider"] == "openai" and "mock openrouter/free" in r["text"]
+    # without --base-url the preset's real endpoint is written; Groq's 8K-per-request cap becomes a context budget
     config.user_env_file().unlink()
     assert main(["setup", "groq", "--key", "gsk_test"]) == 0
+    out = capsys.readouterr().out
+    saved = config.parse_env_text(config.user_env_file().read_text())
+    assert saved["OPENAI_BASE_URL"] == "https://api.groq.com/openai/v1" and saved["PM_ENGINE_OPENAI_MODEL"] == "openai/gpt-oss-120b"
+    assert saved["PM_ENGINE_MAX_INPUT_TOKENS"] == "5000" and saved["PM_ENGINE_MAX_OUTPUT_TOKENS"] == "2500"
+    assert "context budget" in out and "gsk_test" not in out
+    # explicit budget flags win over the preset; gemini has no cap → no budget keys unless asked
+    config.user_env_file().unlink()
+    assert main(["setup", "gemini", "--key", "AIza_test", "--max-input-tokens", "30000"]) == 0
     capsys.readouterr()
     saved = config.parse_env_text(config.user_env_file().read_text())
-    assert saved["OPENAI_BASE_URL"] == "https://api.groq.com/openai/v1" and saved["PM_ENGINE_OPENAI_MODEL"] == "llama-3.3-70b-versatile"
+    assert saved["PM_ENGINE_MAX_INPUT_TOKENS"] == "30000" and "PM_ENGINE_MAX_OUTPUT_TOKENS" not in saved
+    config.user_env_file().unlink()
+    assert main(["setup", "gemini", "--key", "AIza_test"]) == 0
+    capsys.readouterr()
+    assert "PM_ENGINE_MAX_INPUT_TOKENS" not in config.parse_env_text(config.user_env_file().read_text())
 
 
 def test_providers_check_reports_unreachable_endpoint(monkeypatch, capsys):

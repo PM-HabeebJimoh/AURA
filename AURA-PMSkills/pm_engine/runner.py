@@ -13,13 +13,15 @@ completion, the skills used, and the path of any artifact written.
 
 from __future__ import annotations
 
+import os
 import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Sequence
 
-from .prompt import Attachment, Prompt, PromptBuilder, parse_slash
+from .config import load_env_files
+from .prompt import CHARS_PER_TOKEN, Attachment, Prompt, PromptBuilder, estimate_tokens, parse_slash
 from .providers import Completion, Provider, auto_provider
 from .registry import Command, Registry, RegistryError, Skill
 from .search import Hit, SkillIndex
@@ -68,7 +70,28 @@ class RunResult:
         return d
 
 
+DEFAULT_MAX_OUTPUT_TOKENS = 4096
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.environ.get(name, "") or default))
+    except ValueError:
+        return default
+
+
 class Engine:
+    """Executes skills and command workflows against a provider.
+
+    ``max_input_tokens`` (default ``$PM_ENGINE_MAX_INPUT_TOKENS``, 0 = unlimited) is a
+    *context budget*: when a prompt would exceed it the engine first drops the oldest
+    session turns, then truncates attachments, and finally warns (via ``progress``)
+    if the system prompt alone is too big — so small free-tier backends (8K-token
+    requests) get a predictable request instead of an HTTP 413.
+    ``max_output_tokens`` (``$PM_ENGINE_MAX_OUTPUT_TOKENS``, default 4096) is the
+    reply cap used when a call does not pass ``max_tokens`` explicitly.
+    """
+
     def __init__(
         self,
         registry: Registry | None = None,
@@ -76,13 +99,41 @@ class Engine:
         *,
         artifacts_dir: Path | str | None = None,
         auto_load: bool = True,
+        max_input_tokens: int | None = None,
+        max_output_tokens: int | None = None,
     ):
+        load_env_files()
         self.registry = registry or Registry()
         self.provider = provider or auto_provider()
         self.index = SkillIndex(self.registry)
         self.prompts = PromptBuilder(self.registry)
         self.artifacts_dir = Path(artifacts_dir).expanduser() if artifacts_dir else None
         self.auto_load_enabled = auto_load
+        self.max_input_tokens = _env_int("PM_ENGINE_MAX_INPUT_TOKENS", 0) if max_input_tokens is None else max(0, max_input_tokens)
+        self.max_output_tokens = _env_int("PM_ENGINE_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS) if max_output_tokens is None else max_output_tokens
+
+    @property
+    def budget(self) -> dict:
+        return {"max_input_tokens": self.max_input_tokens or None, "max_output_tokens": self.max_output_tokens}
+
+    def budget_report(self) -> dict:
+        """How the marketplace's command prompts (no attachments/history) compare with the budget."""
+        rows = []
+        for plugin in self.registry.plugins.values():
+            for cmd in plugin.commands.values():
+                wf = parse_workflow(cmd)
+                full = self.prompts.for_command(cmd, "").approx_tokens
+                per_step = [self.prompts.for_command(cmd, "", step=i, lean=True).approx_tokens for i in range(1, len(wf.steps_for(None)) + 1)]
+                rows.append({"command": cmd.qualified_name, "full": full, "max_step": max(per_step) if per_step else full})
+        rows.sort(key=lambda r: -r["full"])
+        limit = self.max_input_tokens
+        return {
+            "max_input_tokens": limit or None,
+            "commands": len(rows),
+            "largest": rows[0] if rows else None,
+            "over_full": [r["command"] for r in rows if limit and r["full"] > limit],
+            "over_step": [r["command"] for r in rows if limit and r["max_step"] > limit],
+        }
 
     # -- discovery helpers ---------------------------------------------
 
@@ -100,7 +151,9 @@ class Engine:
                 cmd = self.registry.get_command(slash)
                 wf = parse_workflow(cmd)
                 mode, remaining = resolve_mode(wf, rest)
-                return {"kind": "command", "command": cmd.qualified_name, "mode": mode, "arguments": remaining, "skills": [s.qualified_name for s in self.registry.resolve_command_skills(cmd)], "steps": len(wf.steps_for(mode))}
+                wanted = set(wf.skills_for(mode))
+                skills = [s.qualified_name for s in self.registry.resolve_command_skills(cmd) if s.name in wanted or s.name not in wf.skills]
+                return {"kind": "command", "command": cmd.qualified_name, "mode": mode, "arguments": remaining, "skills": skills, "steps": len(wf.steps_for(mode))}
             except RegistryError:
                 pass
             try:
@@ -155,17 +208,20 @@ class Engine:
                     suggestions = ", ".join(("/" if h.kind == "command" else "") + h.qualified_name for h in self.index.did_you_mean(slash))
                     raise RegistryError(f"{e}. Did you mean: {suggestions or 'n/a'}") from None
 
+        history = session.messages() if session else []
         if command:
             wf = parse_workflow(command)
             mode, _ = resolve_mode(wf, rest)
             total_steps = len(wf.steps_for(mode))
             if step is not None and not (1 <= step <= max(total_steps, 1)):
                 raise ValueError(f"{command.slash} has {total_steps} steps; got step={step}")
-            prompt = self.prompts.for_command(command, rest, atts, extra_skills=extra, step=step, history=session.messages() if session else ())
+            build = lambda a, lean=False: self.prompts.for_command(command, rest, a, extra_skills=extra, step=step, history=history, lean=lean)  # noqa: E731
+            prompt = build(atts)
             skills = prompt.skills
-            log(f"running {command.slash}" + (f" mode={mode}" if mode else "") + (f" step {step}/{total_steps}" if step else f" ({total_steps} steps)"))
         elif skills:
-            prompt = self.prompts.for_skills(skills + [s for s in extra if s not in skills], rest, atts, history=session.messages() if session else ())
+            forced = skills + [s for s in extra if s not in skills]
+            build = lambda a: self.prompts.for_skills(forced, rest, a, history=history)  # noqa: E731
+            prompt = build(atts)
         else:
             auto_skills = self.index.auto_load(text) if self.auto_load_enabled else []
             for s in extra:
@@ -174,11 +230,74 @@ class Engine:
             auto = bool(auto_skills) and not extra
             if auto_skills:
                 log("auto-loaded " + ", ".join(s.qualified_name for s in auto_skills))
-            prompt = self.prompts.for_free_text(text, auto_skills, atts)
+            build = lambda a: self.prompts.for_free_text(text, auto_skills, a)  # noqa: E731
+            prompt = build(atts)
             skills = prompt.skills
 
-        messages = (session.messages() if session else []) + [{"role": "user", "content": prompt.user}]
+        if self.max_input_tokens:
+            prompt, history = self._fit_budget(prompt, history, atts, build, log, lean_ok=command is not None and step is not None)
+            if prompt.skills != skills:
+                skills = prompt.skills
+        if command:
+            log(f"running {command.slash}" + (f" mode={mode}" if mode else "") + (f" step {step}/{total_steps}" if step else f" ({total_steps} steps)") + (f" · skills: {', '.join(s.name for s in skills)}" if skills else " · no skills loaded for this step"))
+
+        messages = history + [{"role": "user", "content": prompt.user}]
         return {"prompt": prompt, "messages": messages, "command": command, "skills": skills, "mode": mode, "step": step, "total_steps": total_steps, "auto": auto, "slash": slash, "rest": rest, "text": text, "log": log}
+
+    def _fit_budget(self, prompt: Prompt, history: list[dict], atts: list[Attachment], build: Callable[..., Prompt], log: ProgressFn, *, lean_ok: bool = False) -> tuple[Prompt, list[dict]]:
+        """Fit the request into ``max_input_tokens``.
+
+        Order: (1) a step-wise command run reloads only the current step's skills
+        (earlier steps' *results* are in the history, which matters more than their
+        instructions); (2) drop the oldest history turns; (3) truncate attachments
+        proportionally; (4) if the system prompt alone is still too big, warn.
+        """
+        budget = self.max_input_tokens
+        hist = list(history)
+        fixed = estimate_tokens(prompt.system) + estimate_tokens(prompt.user)
+        hist_tok = [estimate_tokens(m["content"]) for m in hist]
+        lean = False
+        if lean_ok and fixed + sum(hist_tok) > budget:
+            slim = build(atts, lean=True)
+            if slim.approx_tokens < fixed:
+                prompt, fixed, lean = slim, slim.approx_tokens, True
+        dropped = 0
+        while hist and fixed + sum(hist_tok) > budget:
+            hist.pop(0)
+            hist_tok.pop(0)
+            dropped += 1
+            while hist and hist[0]["role"] != "user":  # keep the alternation user→assistant→…
+                hist.pop(0)
+                hist_tok.pop(0)
+                dropped += 1
+        truncated: list[str] = []
+        if fixed > budget and atts:
+            base = build([], lean=True).approx_tokens if lean else build([]).approx_tokens  # everything except the attachments
+            total = sum(len(a.text) for a in atts)
+            room = int(max(0, budget - base) * CHARS_PER_TOKEN) - 160 * len(atts)  # wrapper + truncation marker per attachment
+            for _ in range(4):  # proportional cut, re-measured (markers/wrappers cost a few tokens)
+                room = max(room, 0)
+                cut = [a.truncated(int(room * len(a.text) / total)) if total > room else a for a in atts]
+                candidate = build(cut, lean=True) if lean else build(cut)
+                size = estimate_tokens(candidate.system) + estimate_tokens(candidate.user)
+                if size <= budget or room == 0:
+                    break
+                room -= int((size - budget) * CHARS_PER_TOKEN) + 32
+            truncated = [a.name for a, c in zip(atts, cut) if c is not a]
+            if truncated:
+                prompt, fixed = candidate, size
+        estimated = fixed + sum(hist_tok)
+        over = max(0, estimated - budget)
+        prompt.metadata["budget"] = {"max_input_tokens": budget, "estimated_tokens": estimated, "lean_skills": lean, "history_turns_dropped": dropped, "attachments_truncated": truncated, "over_by": over}
+        if lean:
+            log(f"context budget {budget}: loading only this step's skills ({', '.join(s.name for s in prompt.skills) or 'none'})")
+        if dropped:
+            log(f"context budget {budget}: dropped the {dropped} oldest session turn(s)")
+        if truncated:
+            log(f"context budget {budget}: truncated attachment(s) {', '.join(truncated)}")
+        if over:
+            log(f"⚠ prompt ≈{estimated} tokens exceeds PM_ENGINE_MAX_INPUT_TOKENS={budget} even without history — the backend may reject it; run the command step by step (--step / --all-steps) or use a backend with a larger context")
+        return prompt, hist
 
     def _finish(self, ctx: dict, completion: Completion, *, session: Session | None, save_artifact: bool) -> RunResult:
         command: Command | None = ctx["command"]
@@ -228,7 +347,7 @@ class Engine:
         session: Session | None = None,
         step: int | None = None,
         extra_skills: Sequence[str] = (),
-        max_tokens: int = 4096,
+        max_tokens: int | None = None,
         temperature: float = 0.4,
         save_artifact: bool = True,
         progress: ProgressFn | None = None,
@@ -241,7 +360,7 @@ class Engine:
         """
         ctx = self._prepare(text, attachments=attachments, session=session, step=step, extra_skills=extra_skills, progress=progress)
         t0 = time.time()
-        completion = self.provider.complete(ctx["prompt"].system, ctx["messages"], max_tokens=max_tokens, temperature=temperature)
+        completion = self.provider.complete(ctx["prompt"].system, ctx["messages"], max_tokens=max_tokens or self.max_output_tokens, temperature=temperature)
         ctx["log"](f"{completion.provider}/{completion.model} responded in {time.time() - t0:.1f}s")
         return self._finish(ctx, completion, session=session, save_artifact=save_artifact)
 
@@ -253,7 +372,7 @@ class Engine:
         session: Session | None = None,
         step: int | None = None,
         extra_skills: Sequence[str] = (),
-        max_tokens: int = 4096,
+        max_tokens: int | None = None,
         temperature: float = 0.4,
         save_artifact: bool = True,
         progress: ProgressFn | None = None,
@@ -262,7 +381,7 @@ class Engine:
         ctx = self._prepare(text, attachments=attachments, session=session, step=step, extra_skills=extra_skills, progress=progress)
         t0 = time.time()
         pieces: list[str] = []
-        for chunk in self.provider.stream(ctx["prompt"].system, ctx["messages"], max_tokens=max_tokens, temperature=temperature):
+        for chunk in self.provider.stream(ctx["prompt"].system, ctx["messages"], max_tokens=max_tokens or self.max_output_tokens, temperature=temperature):
             pieces.append(chunk)
             yield chunk
         full = "".join(pieces)
