@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AURA PM Engine</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --text:#e6e8ee; --muted:#8b93a7; --acc:#7c9cff; --acc2:#3ddc97; --warn:#ffb454; --danger:#ff6b6b; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; background:var(--bg); color:var(--text); }
+  header { display:flex; align-items:center; gap:16px; padding:12px 20px; border-bottom:1px solid var(--line); background:var(--panel); position:sticky; top:0; z-index:5; }
+  header h1 { font-size:16px; margin:0; letter-spacing:.3px; }
+  header .meta { color:var(--muted); font-size:12px; }
+  header .spacer { flex:1; }
+  .pill { padding:2px 8px; border:1px solid var(--line); border-radius:999px; font-size:11px; color:var(--muted); }
+  .pill.ok { border-color:var(--acc2); color:var(--acc2); }
+  main { display:grid; grid-template-columns:320px 1fr; min-height:calc(100vh - 53px); }
+  aside { border-right:1px solid var(--line); background:var(--panel); padding:14px; overflow:auto; max-height:calc(100vh - 53px); position:sticky; top:53px; }
+  aside input { width:100%; padding:8px 10px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--text); }
+  .group { margin-top:14px; }
+  .group h3 { margin:0 0 6px; font-size:11px; text-transform:uppercase; letter-spacing:.8px; color:var(--muted); }
+  .item { padding:6px 8px; border-radius:6px; cursor:pointer; display:flex; gap:8px; align-items:baseline; }
+  .item:hover { background:#1f2430; }
+  .item .n { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12.5px; color:var(--acc); white-space:nowrap; }
+  .item .d { color:var(--muted); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .item.skill .n { color:var(--acc2); }
+  section.content { padding:18px 24px; overflow:auto; }
+  .tabs { display:flex; gap:6px; margin-bottom:14px; }
+  .tab { padding:6px 12px; border:1px solid var(--line); border-radius:8px; cursor:pointer; color:var(--muted); }
+  .tab.active { color:var(--text); border-color:var(--acc); background:#1a1f2b; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:14px; }
+  .card h2 { margin:0 0 8px; font-size:15px; }
+  .card h2 code { color:var(--acc); }
+  .muted { color:var(--muted); }
+  textarea { width:100%; min-height:90px; padding:10px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--text); font:13px/1.5 ui-monospace,Menlo,monospace; resize:vertical; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:8px; }
+  button { padding:8px 14px; border-radius:8px; border:1px solid var(--acc); background:var(--acc); color:#0b0e14; font-weight:600; cursor:pointer; }
+  button.secondary { background:transparent; color:var(--acc); }
+  button:disabled { opacity:.5; cursor:progress; }
+  label.small { font-size:12px; color:var(--muted); display:flex; gap:6px; align-items:center; }
+  input[type=number] { width:64px; padding:6px; border-radius:6px; border:1px solid var(--line); background:var(--bg); color:var(--text); }
+  pre { background:#0b0e14; border:1px solid var(--line); border-radius:8px; padding:12px; overflow:auto; font-size:12.5px; white-space:pre-wrap; }
+  .steps li { margin:4px 0; }
+  .badge { display:inline-block; font-size:11px; padding:1px 6px; border-radius:6px; border:1px solid var(--line); color:var(--muted); margin-left:6px; }
+  .badge.cp { border-color:var(--warn); color:var(--warn); }
+  .badge.sk { border-color:var(--acc2); color:var(--acc2); }
+  .out { white-space:pre-wrap; font-size:13.5px; }
+  .out h1,.out h2,.out h3 { margin:14px 0 6px; }
+  .out table { border-collapse:collapse; margin:8px 0; } .out td,.out th { border:1px solid var(--line); padding:4px 8px; }
+  .offers button { margin:4px 6px 0 0; }
+  .err { color:var(--danger); }
+  .hit { display:flex; gap:10px; align-items:baseline; padding:6px 0; border-bottom:1px dashed var(--line); }
+  .hit .score { font-family:ui-monospace,Menlo,monospace; color:var(--muted); width:52px; }
+  a { color:var(--acc); }
+</style>
+</head>
+<body>
+<header>
+  <h1>🧠 AURA PM Engine</h1>
+  <span class="meta" id="meta">loading…</span>
+  <span class="spacer"></span>
+  <span class="pill" id="provider">provider: …</span>
+  <span class="pill ok" id="counts"></span>
+</header>
+<main>
+  <aside>
+    <input id="q" placeholder="Search skills & commands… (e.g. north star, pre-mortem)">
+    <div id="results"></div>
+    <div id="catalog"></div>
+  </aside>
+  <section class="content">
+    <div class="tabs">
+      <div class="tab active" data-tab="run">Run</div>
+      <div class="tab" data-tab="detail">Details</div>
+      <div class="tab" data-tab="sessions">Sessions</div>
+      <div class="tab" data-tab="validate">Validate</div>
+    </div>
+
+    <div id="tab-run">
+      <div class="card">
+        <h2>Request</h2>
+        <div class="muted">Type a <code>/command</code> (e.g. <code>/write-prd SSO for enterprise</code>), force a skill with <code>/skill-name</code>, or just describe what you need and the engine auto-loads the right skills.</div>
+        <textarea id="text" placeholder="/discover AI meeting summarizer for remote teams"></textarea>
+        <textarea id="attach" style="min-height:60px" placeholder="Optional: paste a document, transcript, CSV or PRD to attach as context"></textarea>
+        <div class="row">
+          <button id="run">Run</button>
+          <button class="secondary" id="resolve">Preview routing</button>
+          <button class="secondary" id="prompt">Show prompt</button>
+          <label class="small">step <input type="number" id="step" min="1" placeholder="all"></label>
+          <label class="small"><input type="checkbox" id="continue" checked> continue session</label>
+          <span class="muted" id="session"></span>
+        </div>
+      </div>
+      <div class="card" id="routing" style="display:none"><h2>Routing</h2><pre id="routing-pre"></pre></div>
+      <div class="card" id="output" style="display:none">
+        <h2>Result <span class="badge" id="out-meta"></span></h2>
+        <div class="out" id="out"></div>
+        <div id="checkpoint" class="muted"></div>
+        <div class="offers" id="offers"></div>
+      </div>
+    </div>
+
+    <div id="tab-detail" style="display:none"><div class="card muted">Pick a skill or command on the left.</div></div>
+    <div id="tab-sessions" style="display:none"></div>
+    <div id="tab-validate" style="display:none"></div>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const api = (p, o) => fetch(p, o).then(async r => { const j = await r.json(); if (!r.ok) throw new Error(j.error || r.statusText); return j; });
+const esc = s => String(s ?? '').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+let sessionId = null;
+
+function md(src) {
+  // small markdown renderer: headings, bold, code, tables, lists
+  const lines = src.split('\n'); let out = [], inCode = false, inTable = false, inList = false;
+  const inline = s => esc(s).replace(/\*\*(.+?)\*\*/g,'<b>$1</b>').replace(/`([^`]+)`/g,'<code>$1</code>').replace(/_(.+?)_/g,'<i>$1</i>');
+  const closeList = () => { if (inList) { out.push('</ul>'); inList = false; } };
+  const closeTable = () => { if (inTable) { out.push('</table>'); inTable = false; } };
+  for (const l of lines) {
+    if (l.startsWith('```')) { closeList(); closeTable(); inCode = !inCode; out.push(inCode ? '<pre>' : '</pre>'); continue; }
+    if (inCode) { out.push(esc(l)); continue; }
+    if (/^\|/.test(l)) { closeList(); if (/^\|[\s:-]+\|/.test(l) && l.replace(/[|\s:-]/g,'')==='') continue; if (!inTable) { out.push('<table>'); inTable = true; } out.push('<tr>' + l.split('|').slice(1,-1).map(c=>'<td>'+inline(c.trim())+'</td>').join('') + '</tr>'); continue; }
+    closeTable();
+    const h = /^(#{1,4})\s+(.*)/.exec(l); if (h) { closeList(); out.push(`<h${h[1].length+1}>${inline(h[2])}</h${h[1].length+1}>`); continue; }
+    const li = /^\s*(?:[-*]|\d+\.)\s+(.*)/.exec(l); if (li) { if (!inList) { out.push('<ul>'); inList = true; } out.push('<li>'+inline(li[1])+'</li>'); continue; }
+    closeList(); out.push(l.trim() ? '<div>'+inline(l)+'</div>' : '<div style="height:6px"></div>');
+  }
+  closeList(); closeTable(); return out.join('\n');
+}
+
+function showTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+  ['run','detail','sessions','validate'].forEach(n => $('#tab-'+n).style.display = n === name ? '' : 'none');
+  if (name === 'sessions') loadSessions();
+  if (name === 'validate') loadValidate();
+}
+document.querySelectorAll('.tab').forEach(t => t.onclick = () => showTab(t.dataset.tab));
+
+async function init() {
+  const h = await api('/api/health');
+  $('#meta').textContent = `${h.marketplace?.name || 'marketplace'} v${h.marketplace?.version || '?'} · engine v${h.version}`;
+  $('#provider').textContent = `provider: ${h.provider}/${h.model}`;
+  $('#counts').textContent = `${h.plugins} plugins · ${h.skills} skills · ${h.commands} commands`;
+  const plugins = await api('/api/plugins');
+  const cmds = await api('/api/commands');
+  const skills = await api('/api/skills');
+  let html = '';
+  for (const p of plugins) {
+    html += `<div class="group"><h3>${esc(p.name)} <span class="muted">(${p.skill_count}s/${p.command_count}c)</span></h3>`;
+    for (const c of cmds.filter(c => c.plugin === p.name)) html += `<div class="item cmd" data-kind="command" data-ref="${esc(c.qualified_name)}"><span class="n">/${esc(c.name)}</span><span class="d">${esc(c.description)}</span></div>`;
+    for (const s of skills.filter(s => s.plugin === p.name)) html += `<div class="item skill" data-kind="skill" data-ref="${esc(s.qualified_name)}"><span class="n">${esc(s.name)}</span><span class="d">${esc(s.description)}</span></div>`;
+    html += '</div>';
+  }
+  $('#catalog').innerHTML = html;
+  $('#catalog').onclick = e => { const it = e.target.closest('.item'); if (it) openDetail(it.dataset.kind, it.dataset.ref); };
+}
+
+let searchTimer;
+$('#q').oninput = () => { clearTimeout(searchTimer); searchTimer = setTimeout(async () => {
+  const q = $('#q').value.trim();
+  if (!q) { $('#results').innerHTML = ''; $('#catalog').style.display = ''; return; }
+  const hits = await api('/api/search?q=' + encodeURIComponent(q) + '&limit=12');
+  $('#catalog').style.display = 'none';
+  $('#results').innerHTML = '<div class="group"><h3>Results</h3>' + hits.map(h => `<div class="item ${h.kind === 'skill' ? 'skill' : 'cmd'}" data-kind="${h.kind}" data-ref="${esc(h.qualified_name)}"><span class="n">${h.kind === 'command' ? '/' : ''}${esc(h.name)}</span><span class="d">${h.score.toFixed(1)} · ${esc(h.description)}</span></div>`).join('') + '</div>';
+  $('#results').onclick = e => { const it = e.target.closest('.item'); if (it) openDetail(it.dataset.kind, it.dataset.ref); };
+}, 180); };
+
+async function openDetail(kind, ref) {
+  showTab('detail');
+  const el = $('#tab-detail');
+  el.innerHTML = '<div class="card muted">loading…</div>';
+  if (kind === 'command') {
+    const c = await api('/api/commands/' + encodeURIComponent(ref));
+    const wf = c.workflow;
+    const stepHtml = steps => '<ol class="steps">' + steps.map(s => `<li><b>${esc(s.title)}</b>${s.skills.map(k=>`<span class="badge sk">${esc(k)}</span>`).join('')}${s.checkpoints.length?'<span class="badge cp">checkpoint</span>':''}${s.parallel?'<span class="badge">parallel</span>':''}${s.checkpoints.map(cp=>`<div class="muted">⏸ ${esc(cp)}</div>`).join('')}</li>`).join('') + '</ol>';
+    let modes = '';
+    for (const [m, steps] of Object.entries(wf.modes || {})) modes += `<h3>mode: ${esc(m)}</h3>` + (steps.length ? stepHtml(steps) : '<div class="muted">template-only mode (uses shared workflow)</div>');
+    el.innerHTML = `
+      <div class="card"><h2><code>/${esc(c.name)}</code> <span class="muted">${esc(c.plugin)}</span></h2>
+        <div>${esc(c.description)}</div>
+        <div class="muted">argument-hint: <code>${esc(c.argument_hint)}</code>${c.allowed_tools ? ' · allowed-tools: <code>'+esc(c.allowed_tools)+'</code>' : ''}</div>
+        <div class="row"><button onclick="useText('/${esc(c.name)} ')">Use in Run</button></div>
+      </div>
+      <div class="card"><h2>Workflow · ${wf.skills.length} skills · ${esc(wf.invocation_examples.join(' · '))}</h2>
+        ${wf.steps.length ? stepHtml(wf.steps) : ''}${modes}
+        ${wf.offers.length ? '<h3>Offers after completion</h3><ul>' + wf.offers.map(o=>`<li>${esc(o)}</li>`).join('') + '</ul>' : ''}
+        ${wf.output_template ? '<h3>Output template</h3><pre>' + esc(wf.output_template) + '</pre>' : ''}
+      </div>
+      <div class="card"><h2>Source</h2><pre>${esc(c.body)}</pre></div>`;
+  } else {
+    const s = await api('/api/skills/' + encodeURIComponent(ref));
+    el.innerHTML = `
+      <div class="card"><h2><code>${esc(s.qualified_name)}</code></h2><div>${esc(s.description)}</div>
+        <div class="muted">${s.word_count} words${s.used_by.length ? ' · used by ' + s.used_by.map(esc).join(', ') : ''}</div>
+        <div class="row"><button onclick="useText('/${esc(s.name)} ')">Force-load in Run</button></div>
+        ${s.further_reading.length ? '<h3>Further reading</h3><ul>' + s.further_reading.map(r=>`<li><a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.title)}</a></li>`).join('') + '</ul>' : ''}
+      </div>
+      <div class="card"><h2>SKILL.md</h2><div class="out">${md(s.body)}</div></div>`;
+  }
+}
+function useText(t) { $('#text').value = t; showTab('run'); $('#text').focus(); }
+
+function payload() {
+  const p = { text: $('#text').value, save_session: true };
+  const a = $('#attach').value.trim(); if (a) p.attachments = [{ name: 'pasted.txt', text: a }];
+  const st = parseInt($('#step').value); if (st) p.step = st;
+  if ($('#continue').checked && sessionId) p.session_id = sessionId;
+  return p;
+}
+$('#resolve').onclick = async () => { $('#routing').style.display = ''; $('#routing-pre').textContent = JSON.stringify(await api('/api/resolve', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload()) }), null, 2); };
+$('#prompt').onclick = async () => { const p = await api('/api/prompt', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload()) }); $('#routing').style.display = ''; $('#routing-pre').textContent = `# skills: ${p.skills.join(', ')}  command: ${p.command || '-'}  ~${p.approx_tokens} tokens\n\n=== SYSTEM ===\n${p.system}\n\n=== USER ===\n${p.user}`; };
+function showResult(r) {
+  sessionId = r.session?.id || sessionId; $('#session').textContent = sessionId ? `session ${sessionId}` : '';
+  $('#out-meta').textContent = `${r.completion.provider}/${r.completion.model} · ${r.command || (r.auto_loaded ? 'auto: ' : '') + r.skills.join(', ') || 'no skill'}${r.step ? ` · step ${r.step}/${r.total_steps}` : ''}${r.artifact ? ' · saved' : ''}`;
+  $('#out').innerHTML = md(r.text);
+  if (r.checkpoint) $('#checkpoint').textContent = '⏸ ' + r.checkpoint;
+  if (r.offers?.length) $('#offers').innerHTML = '<div class="muted" style="margin-top:8px">Next, I can:</div>' + r.offers.map(o => `<button class="secondary" onclick="useText(${JSON.stringify(o)})">${esc(o)}</button>`).join('');
+  if (r.step && r.step < r.total_steps) $('#step').value = r.step + 1;
+}
+$('#run').onclick = async () => {
+  const btn = $('#run'); btn.disabled = true; $('#output').style.display = ''; $('#out').innerHTML = '<span class="muted">running…</span>'; $('#offers').innerHTML = ''; $('#checkpoint').textContent = ''; $('#out-meta').textContent = 'streaming…';
+  try {
+    const resp = await fetch('/api/stream', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload()) });
+    if (!resp.ok || !resp.body) { const j = await resp.json().catch(() => ({})); throw new Error(j.error || resp.statusText); }
+    const reader = resp.body.getReader(); const dec = new TextDecoder(); let buf = '', text = '', done = false;
+    while (!done) {
+      const { value, done: d } = await reader.read(); done = d; if (value) buf += dec.decode(value, { stream: true });
+      let idx; while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const frame = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        const ev = /^event: (\w+)/m.exec(frame)?.[1]; const dataLine = frame.split('\n').find(l => l.startsWith('data: '));
+        if (!ev || !dataLine) continue; const data = JSON.parse(dataLine.slice(6));
+        if (ev === 'chunk') { text += data.text; $('#out').innerHTML = md(text); }
+        else if (ev === 'result') showResult(data);
+        else if (ev === 'error') throw new Error(data.error);
+      }
+    }
+  } catch (e) { $('#out').innerHTML = `<span class="err">${esc(e.message)}</span>`; $('#out-meta').textContent = 'error'; }
+  btn.disabled = false;
+};
+
+async function loadSessions() {
+  const rows = await api('/api/sessions');
+  $('#tab-sessions').innerHTML = rows.length ? rows.map(s => `<div class="card"><h2>${esc(s.title || s.id)} <span class="badge">${s.turns} turns</span>${s.active_command ? `<span class="badge cp">${esc(s.active_command)} step ${s.current_step}/${s.total_steps}</span>` : ''}</h2><div class="muted">${esc(s.id)}</div><div class="row"><button class="secondary" onclick="resumeSession('${esc(s.id)}')">Resume</button><button class="secondary" onclick="viewSession('${esc(s.id)}')">View</button><button class="secondary" onclick="delSession('${esc(s.id)}')">Delete</button></div><div id="sess-${esc(s.id)}"></div></div>`).join('') : '<div class="card muted">No sessions yet.</div>';
+}
+function resumeSession(id) { sessionId = id; $('#session').textContent = 'session ' + id; showTab('run'); }
+async function viewSession(id) { const s = await api('/api/sessions/' + id); $('#sess-' + id).innerHTML = s.turns.map(t => `<div class="card"><div class="muted">${esc(t.role)}${t.command ? ' · ' + esc(t.command) : ''}${t.step ? ' · step ' + t.step : ''}</div><div class="out">${md(t.content)}</div></div>`).join(''); }
+async function delSession(id) { await api('/api/sessions/' + id, { method:'DELETE' }); loadSessions(); }
+async function loadValidate() {
+  const v = await api('/api/validate');
+  $('#tab-validate').innerHTML = `<div class="card"><h2>${v.ok ? '✅ ALL CHECKS PASSED' : '❌ ' + v.errors.length + ' errors'} <span class="badge">${v.warnings.length} warnings</span></h2><pre>${esc(JSON.stringify(v.info, null, 2))}</pre>${v.errors.map(e=>`<div class="err">✗ ${esc(e)}</div>`).join('')}${v.warnings.map(w=>`<div class="muted">⚠ ${esc(w)}</div>`).join('')}</div>`;
+}
+init().catch(e => { $('#meta').textContent = 'error: ' + e.message; });
+</script>
+</body>
+</html>

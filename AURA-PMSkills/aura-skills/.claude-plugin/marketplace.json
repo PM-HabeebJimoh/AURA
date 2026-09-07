@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "aura-skills",
+  "version": "0.1.0",
+  "description": "aura-skills — skills and workflows authored for the AURA PM Engine.",
+  "owner": {
+    "name": "AURA"
+  },
+  "plugins": [
+    {
+      "name": "aura-architecture",
+      "description": "AURA-specific PM skills for AI-driven architectural design: floor-plan briefs, design-quality scoring, and construction-cost sanity checks for the Nigerian market.",
+      "source": "./aura-architecture",
+      "category": "product-management"
+    }
+  ]
+}
